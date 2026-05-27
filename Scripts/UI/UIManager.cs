@@ -1,0 +1,405 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+using System.Collections;
+using RPG.Character;
+using RPG.Combat;
+
+namespace RPG.UI
+{
+    public class UIManager : MonoBehaviour
+    {
+        public static UIManager Instance { get; private set; }
+
+        [Header("Player HUD")]
+        [SerializeField] private Slider   hpBar;
+        [SerializeField] private TMP_Text hpText;
+        [SerializeField] private Slider   mpBar;
+        [SerializeField] private TMP_Text mpText;
+        [SerializeField] private TMP_Text playerNameText;
+        [SerializeField] private TMP_Text levelText;
+
+        [Header("Target Panel")]
+        [SerializeField] private GameObject targetPanel;
+        [SerializeField] private TMP_Text   targetNameText;
+        [SerializeField] private Slider     targetHPBar;
+        [SerializeField] private TMP_Text   targetHPText;
+
+        [Header("Skill Bar")]
+        [SerializeField] private SkillSlotUI[] skillSlots;
+        [SerializeField] private string[] hotkeyLabels = { "Q", "W", "E", "R" };
+
+        [Header("Message")]
+        [SerializeField] private TMP_Text messageText;
+        [SerializeField] private float    messageDisplayTime = 2f;
+
+        [Header("Experience")]
+        [SerializeField] private Slider   expBar;
+        [SerializeField] private TMP_Text expText;
+
+        [Header("Feedback")]
+        [SerializeField] private Image damageFlashImage;
+        [SerializeField] private float flashDuration = 0.2f;
+        [SerializeField] private Color flashColor    = new Color(1f, 0f, 0f, 0.4f);
+
+        [Header("Attribute Window")]
+        [SerializeField] private AttributeWindowUI attributeWindow;
+        [SerializeField] private Button            attributeWindowButton;
+
+        [Header("Chat")]
+        [SerializeField] private ChatUI chatUI;
+
+        [Header("Party")]
+        [SerializeField] private PartyUI partyUI;
+
+        [Header("Atalhos de UI (opcional)")]
+        [SerializeField] private Button inventoryHudButton;
+        [SerializeField] private Button powerGemHudButton;
+
+        private PlayerEntity              _player;
+        private SkillSystem               _skills;
+        private RPG.Network.NetworkPlayer _netPlayer;
+        private float                     _messageTimer;
+
+        private UnityEngine.Events.UnityAction _attributeButtonCallback;
+        private UnityEngine.Events.UnityAction _inventoryButtonCallback;
+        private UnityEngine.Events.UnityAction _powerGemButtonCallback;
+
+        private bool _hudButtonsRegistered      = false;
+        private bool _attributeButtonRegistered = false;
+
+        private Coroutine _flashCoroutine;
+
+        private void Awake()
+        {
+            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+            Instance = this;
+        }
+
+        private void Start()
+        {
+            ClearTargetPanel();
+            if (messageText != null) messageText.text = "";
+
+            if (damageFlashImage != null)
+            {
+                damageFlashImage.color = new Color(flashColor.r, flashColor.g, flashColor.b, 0f);
+                damageFlashImage.gameObject.SetActive(false);
+            }
+
+            if (attributeWindowButton != null && !_attributeButtonRegistered)
+            {
+                _attributeButtonCallback = () => attributeWindow?.Toggle();
+                attributeWindowButton.onClick.AddListener(_attributeButtonCallback);
+                _attributeButtonRegistered = true;
+            }
+
+            RegisterHudButtonsSafe();
+
+            var player = FindFirstObjectByType<PlayerEntity>();
+            if (player != null && player.IsInitialized)
+                BindLocalPlayer(player);
+        }
+
+        private void OnDestroy()
+        {
+            UnsubscribeFromPlayer();
+            UnsubscribeFromSkills();
+
+            if (attributeWindowButton != null && _attributeButtonCallback != null)
+            {
+                attributeWindowButton.onClick.RemoveListener(_attributeButtonCallback);
+                _attributeButtonCallback = null;
+            }
+
+            UnregisterHudButtons();
+
+            if (Instance == this) Instance = null;
+        }
+
+        /// <summary>
+        /// FIX: a lógica anterior de _hudButtonsRegistered era incorreta.
+        /// Antes: a flag era definida como true numa condição composta confusa
+        /// que poderia ser true mesmo sem registrar listeners. Agora a flag só
+        /// é definida como true quando TODOS os botões configurados foram
+        /// efetivamente registrados — sem callbacks pendentes.
+        /// </summary>
+        private void RegisterHudButtonsSafe()
+        {
+            if (_hudButtonsRegistered) return;
+
+            // Inventory button
+            if (inventoryHudButton != null && _inventoryButtonCallback == null)
+            {
+                _inventoryButtonCallback = () =>
+                {
+                    if (InventoryUI.Instance != null)
+                        InventoryUI.Instance.Toggle();
+                    else
+                        Debug.LogWarning("[UIManager] InventoryUI.Instance é null ao clicar no botão!");
+                };
+                inventoryHudButton.onClick.AddListener(_inventoryButtonCallback);
+            }
+
+            // Power Gem button
+            if (powerGemHudButton != null && _powerGemButtonCallback == null)
+            {
+                _powerGemButtonCallback = () =>
+                {
+                    if (PowerGemUI.Instance != null)
+                        PowerGemUI.Instance.Toggle();
+                    else
+                        Debug.LogWarning("[UIManager] PowerGemUI.Instance é null ao clicar no botão!");
+                };
+                powerGemHudButton.onClick.AddListener(_powerGemButtonCallback);
+            }
+
+            _hudButtonsRegistered = true;
+        }
+
+        private void UnregisterHudButtons()
+        {
+            if (inventoryHudButton != null && _inventoryButtonCallback != null)
+            {
+                inventoryHudButton.onClick.RemoveListener(_inventoryButtonCallback);
+                _inventoryButtonCallback = null;
+            }
+            if (powerGemHudButton != null && _powerGemButtonCallback != null)
+            {
+                powerGemHudButton.onClick.RemoveListener(_powerGemButtonCallback);
+                _powerGemButtonCallback = null;
+            }
+            _hudButtonsRegistered = false;
+        }
+
+        // ── Vinculação ────────────────────────────────────────────────────
+
+        public void BindLocalPlayer(PlayerEntity player)
+        {
+            if (player == null) return;
+
+            if (_player == player)
+            {
+                attributeWindow?.BindPlayer(player);
+                if (player.IsInitialized) ForceRefreshAll();
+                RegisterHudButtonsSafe();
+                return;
+            }
+
+            UnsubscribeFromPlayer();
+            UnsubscribeFromSkills();
+
+            _player    = player;
+            _skills    = player.GetComponent<SkillSystem>();
+            _netPlayer = player.GetComponent<RPG.Network.NetworkPlayer>();
+
+            _player.OnHPChanged    += UpdateHP;
+            _player.OnMPChanged    += UpdateMP;
+            _player.OnStatsChanged += OnStatsChangedHandler;
+            _player.OnInitialized  += OnPlayerInitialized;
+            _player.OnHPChanged    += OnPlayerDamageFeedback;
+
+            if (_skills != null)
+            {
+                _skills.OnCooldownStarted      += OnSkillCooldown;
+                _skills.OnSkillBarNeedsRefresh += InitSkillBar;
+                InitSkillBar();
+            }
+
+            attributeWindow?.BindPlayer(player);
+
+            var inventory = player.GetComponent<RPG.Network.NetworkInventory>();
+            if (inventory != null)
+            {
+                InventoryUI.Instance?.BindInventory(inventory);
+                PowerGemUI.Instance?.BindInventory(inventory);
+            }
+
+            RegisterHudButtonsSafe();
+
+            if (player.IsInitialized)
+                ForceRefreshAll();
+        }
+
+        private void UnsubscribeFromPlayer()
+        {
+            if (_player == null) return;
+            _player.OnHPChanged    -= UpdateHP;
+            _player.OnMPChanged    -= UpdateMP;
+            _player.OnStatsChanged -= OnStatsChangedHandler;
+            _player.OnInitialized  -= OnPlayerInitialized;
+            _player.OnHPChanged    -= OnPlayerDamageFeedback;
+        }
+
+        private void UnsubscribeFromSkills()
+        {
+            if (_skills == null) return;
+            _skills.OnCooldownStarted      -= OnSkillCooldown;
+            _skills.OnSkillBarNeedsRefresh -= InitSkillBar;
+        }
+
+        private void OnPlayerInitialized()
+        {
+            if (_player != null) _lastHP = _player.CurrentHP;
+            ForceRefreshAll();
+        }
+
+        private void OnSkillCooldown(int index, float duration)
+        {
+            if (skillSlots != null && index >= 0 && index < skillSlots.Length)
+                skillSlots[index]?.StartCooldown(duration);
+        }
+
+        private void OnStatsChangedHandler()
+        {
+            if (_player == null || !_player.IsInitialized) return;
+            int level = _netPlayer != null ? _netPlayer.Level : (_player.Data?.Level ?? 1);
+            if (levelText != null) levelText.text = $"Lv {level}";
+        }
+
+        private void InitSkillBar()
+        {
+            if (_skills == null || skillSlots == null) return;
+
+            for (int i = 0; i < skillSlots.Length; i++)
+            {
+                if (skillSlots[i] == null) continue;
+
+                var skill = _skills.GetSkill(i);
+                skillSlots[i].SetIcon(skill?.Icon);
+
+                if (hotkeyLabels != null && i < hotkeyLabels.Length)
+                    skillSlots[i].SetHotkey(hotkeyLabels[i]);
+            }
+        }
+
+        // ── Update — só timer de mensagem ─────────────────────────────────
+
+        private void Update()
+        {
+            if (_messageTimer > 0)
+            {
+                _messageTimer -= Time.deltaTime;
+                if (_messageTimer <= 0 && messageText != null)
+                    messageText.text = "";
+            }
+        }
+
+        // ── HP / MP ───────────────────────────────────────────────────────
+
+        private void UpdateHP(float current, float max)
+        {
+            if (hpBar  != null) { hpBar.maxValue = Mathf.Max(1f, max); hpBar.value = current; }
+            if (hpText != null) hpText.text = $"{current:0}/{max:0}";
+        }
+
+        private void UpdateMP(float current, float max)
+        {
+            if (mpBar  != null) { mpBar.maxValue = Mathf.Max(1f, max); mpBar.value = current; }
+            if (mpText != null) mpText.text = $"{current:0}/{max:0}";
+        }
+
+        private void ForceRefreshAll()
+        {
+            if (_player == null) return;
+
+            float hp = _player.CurrentHP, maxHp = _player.Stats?.MaxHP ?? 1f;
+            float mp = _player.CurrentMP, maxMp = _player.Stats?.MaxMP ?? 1f;
+
+            UpdateHP(hp, maxHp);
+            UpdateMP(mp, maxMp);
+
+            if (playerNameText != null) playerNameText.text = _player.Data?.CharacterName ?? "Player";
+
+            int level = _netPlayer != null ? _netPlayer.Level : (_player.Data?.Level ?? 1);
+            if (levelText != null) levelText.text = $"Lv {level}";
+
+            if (_netPlayer != null)
+                RefreshExpBar(_netPlayer.Experience, _netPlayer.ExperienceToNextLevel);
+
+            InitSkillBar();
+        }
+
+        public void RefreshLevel(int newLevel)
+        {
+            if (levelText != null) levelText.text = $"Lv {newLevel}";
+        }
+
+        public void RefreshExpBar(long exp, long expToNext)
+        {
+            if (expBar  != null) { expBar.maxValue = Mathf.Max(1f, expToNext); expBar.value = exp; }
+            if (expText != null) expText.text = $"{exp}/{expToNext}";
+        }
+
+        // ── Target Panel ──────────────────────────────────────────────────
+
+        public void UpdateTargetPanel(ITargetable target)
+        {
+            if (target == null) { ClearTargetPanel(); return; }
+            if (targetPanel    != null) targetPanel.SetActive(true);
+            if (targetNameText != null) targetNameText.text = target.DisplayName;
+            RefreshTargetHP(target);
+        }
+
+        public void RefreshTargetPanel(ITargetable target)
+        {
+            if (target == null || targetPanel == null || !targetPanel.activeSelf) return;
+            RefreshTargetHP(target);
+        }
+
+        private void RefreshTargetHP(ITargetable target)
+        {
+            if (targetHPBar  != null) { targetHPBar.maxValue = Mathf.Max(1f, target.MaxHP); targetHPBar.value = target.CurrentHP; }
+            if (targetHPText != null) targetHPText.text = $"{target.CurrentHP:0}/{target.MaxHP:0}";
+        }
+
+        public void ClearTargetPanel()
+        {
+            if (targetPanel != null) targetPanel.SetActive(false);
+        }
+
+        // ── Message ───────────────────────────────────────────────────────
+
+        public void ShowMessage(string msg)
+        {
+            if (messageText == null) return;
+            messageText.text = msg;
+            _messageTimer    = messageDisplayTime;
+        }
+
+        // ── Feedback Visual (Damage Flash) ────────────────────────
+
+        private float _lastHP;
+
+        private void OnPlayerDamageFeedback(float current, float max)
+        {
+            if (current < _lastHP && current > 0)
+            {
+                TriggerDamageFlash();
+            }
+            _lastHP = current;
+        }
+
+        public void TriggerDamageFlash()
+        {
+            if (damageFlashImage == null) return;
+            if (_flashCoroutine != null) StopCoroutine(_flashCoroutine);
+            _flashCoroutine = StartCoroutine(DamageFlashRoutine());
+        }
+
+        private IEnumerator DamageFlashRoutine()
+        {
+            damageFlashImage.gameObject.SetActive(true);
+            float elapsed = 0f;
+            while (elapsed < flashDuration)
+            {
+                elapsed += Time.deltaTime;
+                float alpha = Mathf.Lerp(flashColor.a, 0f, elapsed / flashDuration);
+                damageFlashImage.color = new Color(flashColor.r, flashColor.g, flashColor.b, alpha);
+                yield return null;
+            }
+            damageFlashImage.gameObject.SetActive(false);
+            _flashCoroutine = null;
+        }
+    }
+}
