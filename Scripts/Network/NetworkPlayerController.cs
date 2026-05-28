@@ -78,8 +78,6 @@ namespace RPG.Network
         private Vector3 _serverLastPosition;
         private float   _serverLastMoveTime;
         private const float SPEED_HACK_TOLERANCE = 1.6f;  // Aumentado para 60% de margem (mais seguro contra jitter)
-        private const float TELEPORT_THRESHOLD   = 25f;   // Distância máxima por segundo para Rubberbanding
-        private const float MIN_CHECK_DISTANCE   = 2.0f;  // Ignora movimentos muito curtos para evitar drift de float
 
         // ══════════════════════════════════════════════════════════════════
         // Lifecycle
@@ -452,63 +450,72 @@ namespace RPG.Network
             if (netPlayer == null || netPlayer.Dead) return;
 
             // --- Anti-SpeedHack Validation ---
+            // 1. Valida o movimento REAL realizado desde o último comando recebido.
+            // Isso fecha o buraco onde o jogador atualizava a posição de segurança para o destino
+            // antes mesmo de chegar lá, permitindo "teletransporte legal".
             float timePassed = Time.time - _serverLastMoveTime;
-            if (timePassed > 0.05f) // Evita checks em frames colados
+            if (timePassed > 0.05f) 
             {
-                float distMoved = Vector3.Distance(_serverLastPosition, destination);
+                float actualDistMoved = Vector3.Distance(_serverLastPosition, transform.position);
                 float maxSpeed  = (_playerEntity != null && _playerEntity.Stats != null) 
                     ? _playerEntity.Stats.MoveSpeed 
                     : AGENT_MAX_SPEED;
 
-                float maxAllowedDist = maxSpeed * timePassed * SPEED_HACK_TOLERANCE;
+                // Tolerância inclui margem para latência e jitter. 
+                // Removemos o MIN_CHECK_DISTANCE para evitar sucessivos micro-teleportes abaixo do radar.
+                float maxAllowedDist = (maxSpeed * timePassed * SPEED_HACK_TOLERANCE) + 0.5f;
                 
-                // Se moveu mais que o permitido (e não é um "teleport" pequeno de lag)
-                if (distMoved > maxAllowedDist && distMoved > MIN_CHECK_DISTANCE)
+                if (actualDistMoved > maxAllowedDist)
                 {
                     if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
                     {
                         _lastSecurityWarnTime = Time.time;
-                        Debug.LogWarning($"[Security] Movimento suspeito: {netPlayer.CharacterName} | Dist: {distMoved:0.1} | Max: {maxAllowedDist:0.1} | T: {timePassed:0.00}s");
+                        Debug.LogWarning($"[Security] Movimento suspeito: {netPlayer.CharacterName} | Real: {actualDistMoved:0.1} | Max: {maxAllowedDist:0.1} | T: {timePassed:0.00}s");
                     }
                     
-                    // Se a discrepância for absurda (Teleport/SpeedHack pesado), trava o movimento
-                    if (distMoved > TELEPORT_THRESHOLD)
-                    {
-                        Debug.LogWarning($"[Security] Rubberbanding em {netPlayer.CharacterName} - Distância {distMoved:0.1}m em {timePassed:0.00}s");
-                        _agent.Warp(_serverLastPosition);
-                        return;
-                    }
+                    // Rubberbanding imediato: volta o jogador para a última posição segura conhecida pelo servidor
+                    _agent.Warp(_serverLastPosition);
+                    return;
                 }
             }
 
-            _serverLastPosition = destination;
-            _serverLastMoveTime = Time.time;
+            // 2. Validação de Bounds / NavMesh do DESTINO
+            Vector3 finalDest = destination;
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2.0f, NavMesh.AllAreas))
+            {
+                finalDest = hit.position;
+            }
+            else
+            {
+                if (debugMovement)
+                    Debug.LogWarning($"[Server] CmdMoveTo: destino fora do NavMesh para {netPlayer.CharacterName}");
+                return;
+            }
 
-            float totalDist = Vector3.Distance(transform.position, destination);
+            // 3. Limite de distância do clique (anti-map-warp)
+            float totalDist = Vector3.Distance(transform.position, finalDest);
             if (totalDist > MAX_MOVE_DIST)
             {
                 if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
                 {
                     _lastSecurityWarnTime = Time.time;
-                    Debug.LogWarning($"[Security] CmdMoveTo suspeito: dist={totalDist:0.0} | {netPlayer.CharacterName}");
+                    Debug.LogWarning($"[Security] CmdMoveTo muito longo: dist={totalDist:0.0} | {netPlayer.CharacterName}");
                 }
                 return;
             }
 
-            if (_agent == null) return;
+            // Atualiza o checkpoint de segurança ANTES de mudar o destino do agent.
+            // O próximo CmdMoveTo validará se o deslocamento até aqui foi condizente com o tempo.
+            _serverLastPosition = transform.position;
+            _serverLastMoveTime = Time.time;
 
-            Vector3 finalDest = destination;
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 3f, NavMesh.AllAreas)
-                || NavMesh.SamplePosition(destination, out hit, 6f, NavMesh.AllAreas))
+            if (_agent != null && _agent.isOnNavMesh)
             {
-                finalDest = hit.position;
+                _agent.SetDestination(finalDest);
+                _agent.speed = (_playerEntity != null && _playerEntity.Stats != null) 
+                    ? Mathf.Clamp(_playerEntity.Stats.MoveSpeed, AGENT_MIN_SPEED, AGENT_MAX_SPEED)
+                    : AGENT_MAX_SPEED;
             }
-            else if (debugMovement)
-            {
-                Debug.LogWarning($"[Server] CmdMoveTo: destino fora do NavMesh para {netPlayer.CharacterName}");
-            }
-
-            _agent.SetDestination(finalDest);
         }
 
         // ══════════════════════════════════════════════════════════════════

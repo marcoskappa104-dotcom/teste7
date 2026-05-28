@@ -293,8 +293,8 @@ namespace RPG.UI
 
         private static string FormatReq(string text, bool met)
             => met
-                ? $"<color=#88FF88>✓ {text}</color>"
-                : $"<color=#FF6666>✗ {text}</color>";
+                ? $"<color=#88FF88>[v] {text}</color>"
+                : $"<color=#FF6666>[x] {text}</color>";
 
         /// <summary>
         /// Lê stats do jogador local SEM alocar. Usa GetRaceEnum() do

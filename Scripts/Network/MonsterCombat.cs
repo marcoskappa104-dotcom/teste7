@@ -6,6 +6,7 @@ using RPG.Data;
 using RPG.UI;
 using RPG.Combat;
 using RPG.Managers;
+using RPG.Character;
 
 namespace RPG.Network
 {
@@ -247,22 +248,42 @@ namespace RPG.Network
             {
                 // FIX: Usa OverlapSphereNonAlloc e HashSet para evitar dano duplo ou perda do alvo principal
                 int count = Physics.OverlapSphereNonAlloc(transform.position, skill.AoERadius, _aoeBuffer);
-                var hitEntities = new HashSet<NetworkMonsterEntity>();
+                var hitEntities = new HashSet<ITargetable>();
                 
                 // Sempre garante que o alvo direto recebe o dano
                 hitEntities.Add(_entity);
 
                 for (int i = 0; i < count; i++)
                 {
-                    var otherMonster = _aoeBuffer[i].GetComponent<NetworkMonsterEntity>();
-                    if (otherMonster != null && !otherMonster.IsDead)
-                        hitEntities.Add(otherMonster);
+                    var targetable = _aoeBuffer[i].GetComponent<ITargetable>();
+                    if (targetable != null && !targetable.IsDead)
+                    {
+                        // Filtro de segurança: Não atinge NPCs ou objetos sem combate
+                        // No futuro, aqui entra a lógica de Party/Team/PvP
+                        if (targetable is NetworkMonsterEntity || targetable is NetworkPlayer)
+                        {
+                            hitEntities.Add(targetable);
+                        }
+                    }
                 }
 
-                foreach (var entity in hitEntities)
+                foreach (var target in hitEntities)
                 {
-                    var otherCombat = entity.GetComponent<MonsterCombat>();
-                    otherCombat?.ServerTakeDamageFromPlayer(attacker, atkStats, isPhysical, skill);
+                    if (target is NetworkMonsterEntity monster)
+                    {
+                        var otherCombat = monster.GetComponent<MonsterCombat>();
+                        otherCombat?.ServerTakeDamageFromPlayer(attacker, atkStats, isPhysical, skill);
+                    }
+                    else if (target is NetworkPlayer targetPlayer)
+                    {
+                        // PvP - Dano em outros jogadores
+                        // Por enquanto, aplicamos o dano base se não for o próprio atacante
+                        if (targetPlayer != attacker)
+                        {
+                            float dmg = isPhysical ? atkStats.ATK : atkStats.MATK;
+                            targetPlayer.ServerApplyDamageWithFeedback(dmg * skill.AtkMultiplier);
+                        }
+                    }
                 }
             }
             else

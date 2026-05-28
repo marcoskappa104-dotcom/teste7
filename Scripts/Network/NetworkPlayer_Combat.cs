@@ -13,7 +13,7 @@ namespace RPG.Network
         [Server]
         public void ServerApplyDamage(float dmg)
         {
-            if (Dead) return;
+            if (Dead || _serverImmunityTimer > 0f) return;
             dmg = SanitizeAmount(dmg);
             if (dmg <= 0f) return;
 
@@ -26,7 +26,7 @@ namespace RPG.Network
         [Server]
         public void ServerApplyDamageWithFeedback(float dmg)
         {
-            if (Dead) return;
+            if (Dead || _serverImmunityTimer > 0f) return;
             dmg = SanitizeAmount(dmg);
             if (dmg <= 0f) return;
 
@@ -87,10 +87,14 @@ namespace RPG.Network
             long penalty = 0;
             if (_serverCharData != null && Level > 1)
             {
-                // FIX: penalidade baseada no XP atual no level para evitar perdas desproporcionais
-                // ou level-down silencioso. Clampa em 5% do progresso atual.
-                penalty = (long)(Experience * 0.05f); 
-                if (penalty < 1 && Experience > 0) penalty = 1;
+                // FIX: Penalidade de 5% do XP total do nível atual.
+                // Cap mínimo de 1% do nível para garantir que a morte tenha peso.
+                penalty = (long)(ExperienceToNextLevel * 0.05f);
+                long minPenalty = (long)(ExperienceToNextLevel * 0.01f);
+                if (penalty < minPenalty) penalty = minPenalty;
+
+                // Não remove mais do que o player tem no nível atual para evitar frustração extrema
+                if (penalty > Experience) penalty = Experience;
 
                 _serverCharData.RemoveExperience(penalty);
                 Experience = _serverCharData.Experience;
@@ -116,6 +120,9 @@ namespace RPG.Network
             MaxMP     = Mathf.Min(_serverStats.MaxMP, GameConstants.Combat.MAX_MP);
             CurrentHP = MaxHP * 0.5f;
             CurrentMP = MaxMP * 0.5f;
+
+            // FIX: Imunidade temporária (5s) após respawn para evitar death-loop
+            _serverImmunityTimer = 5f;
 
             // FIX: Sincroniza a posição no anti-cheat após o Respawn/Warp
             _controller?.ServerSyncSafetyPosition(pos);

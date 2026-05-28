@@ -624,39 +624,46 @@ namespace RPG.Managers
         public void SaveCharacter(CharacterData ch, string username)
         {
             if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
-
             var snap = SnapShotCharacterRow(ch, username);
+            EnqueueWrite(() => SaveCharacterInternal(snap));
+        }
 
-            EnqueueWrite(() =>
+        public void SaveCharacterSync(CharacterData ch, string username)
+        {
+            if (ch == null || string.IsNullOrWhiteSpace(ch.CharacterId)) return;
+            var snap = SnapShotCharacterRow(ch, username);
+            SaveCharacterInternal(snap);
+        }
+
+        private void SaveCharacterInternal(CharacterRow snap)
+        {
+            try
             {
-                try
+                lock (_dbLock)
                 {
-                    lock (_dbLock)
-                    {
-                        _db.Execute(@"
-                            UPDATE characters SET
-                                level       = ?, experience  = ?, exp_to_next = ?,
-                                current_hp  = ?, current_mp  = ?,
-                                pos_x       = ?, pos_y       = ?, pos_z       = ?,
-                                current_map = ?, free_points = ?,
-                                alloc_str   = ?, alloc_agi   = ?, alloc_vit   = ?,
-                                alloc_dex   = ?, alloc_int   = ?, alloc_luk   = ?,
-                                base_str    = ?, base_agi    = ?, base_vit    = ?,
-                                base_dex    = ?, base_int    = ?, base_luk    = ?
-                            WHERE character_id = ? AND LOWER(username) = LOWER(?)",
-                            snap.Level, snap.Experience, snap.ExpToNext,
-                            snap.CurrentHP, snap.CurrentMP,
-                            snap.PosX, snap.PosY, snap.PosZ,
-                            snap.CurrentMap, snap.FreePoints,
-                            snap.AllocSTR, snap.AllocAGI, snap.AllocVIT,
-                            snap.AllocDEX, snap.AllocINT, snap.AllocLUK,
-                            snap.BaseSTR, snap.BaseAGI, snap.BaseVIT,
-                            snap.BaseDEX, snap.BaseINT, snap.BaseLUK,
-                            snap.CharacterId, snap.Username);
-                    }
+                    _db.Execute(@"
+                        UPDATE characters SET
+                            level       = ?, experience  = ?, exp_to_next = ?,
+                            current_hp  = ?, current_mp  = ?,
+                            pos_x       = ?, pos_y       = ?, pos_z       = ?,
+                            current_map = ?, free_points = ?,
+                            alloc_str   = ?, alloc_agi   = ?, alloc_vit   = ?,
+                            alloc_dex   = ?, alloc_int   = ?, alloc_luk   = ?,
+                            base_str    = ?, base_agi    = ?, base_vit    = ?,
+                            base_dex    = ?, base_int    = ?, base_luk    = ?
+                        WHERE character_id = ? AND LOWER(username) = LOWER(?)",
+                        snap.Level, snap.Experience, snap.ExpToNext,
+                        snap.CurrentHP, snap.CurrentMP,
+                        snap.PosX, snap.PosY, snap.PosZ,
+                        snap.CurrentMap, snap.FreePoints,
+                        snap.AllocSTR, snap.AllocAGI, snap.AllocVIT,
+                        snap.AllocDEX, snap.AllocINT, snap.AllocLUK,
+                        snap.BaseSTR, snap.BaseAGI, snap.BaseVIT,
+                        snap.BaseDEX, snap.BaseINT, snap.BaseLUK,
+                        snap.CharacterId, snap.Username);
                 }
-                catch (Exception e) { Debug.LogError($"[DB] SaveCharacter: {e.Message}"); }
-            });
+            }
+            catch (Exception e) { Debug.LogError($"[DB] SaveCharacterInternal: {e.Message}"); }
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -681,39 +688,45 @@ namespace RPG.Managers
         public void SaveInventory(string characterId, string username, List<InventorySlotData> slots)
         {
             if (string.IsNullOrWhiteSpace(characterId)) return;
-
             string charId = characterId;
             var copy = new List<InventorySlotData>(slots);
+            EnqueueWrite(() => SaveInventoryInternal(charId, copy));
+        }
 
-            EnqueueWrite(() =>
+        public void SaveInventorySync(string characterId, string username, List<InventorySlotData> slots)
+        {
+            if (string.IsNullOrWhiteSpace(characterId)) return;
+            SaveInventoryInternal(characterId, slots);
+        }
+
+        private void SaveInventoryInternal(string charId, List<InventorySlotData> copy)
+        {
+            try
             {
-                try
+                lock (_dbLock)
                 {
-                    lock (_dbLock)
+                    _db.RunInTransaction(() =>
                     {
-                        _db.RunInTransaction(() =>
-                        {
-                            _db.Execute(
-                                "DELETE FROM inventory WHERE character_id = ? AND is_equipped = 0",
-                                charId);
+                        _db.Execute(
+                            "DELETE FROM inventory WHERE character_id = ? AND is_equipped = 0",
+                            charId);
 
-                            foreach (var slot in copy)
+                        foreach (var slot in copy)
+                        {
+                            if (string.IsNullOrEmpty(slot.ItemId)) continue;
+                            _db.Insert(new InventoryRow
                             {
-                                if (string.IsNullOrEmpty(slot.ItemId)) continue;
-                                _db.Insert(new InventoryRow
-                                {
-                                    CharacterId = charId,
-                                    ItemId      = slot.ItemId,
-                                    Quantity    = slot.Quantity,
-                                    SlotIndex   = slot.SlotIndex,
-                                    IsEquipped  = false
-                                });
-                            }
-                        });
-                    }
+                                CharacterId = charId,
+                                ItemId      = slot.ItemId,
+                                Quantity    = slot.Quantity,
+                                SlotIndex   = slot.SlotIndex,
+                                IsEquipped  = false
+                            });
+                        }
+                    });
                 }
-                catch (Exception e) { Debug.LogError($"[DB] SaveInventory: {e.Message}"); }
-            });
+            }
+            catch (Exception e) { Debug.LogError($"[DB] SaveInventoryInternal: {e.Message}"); }
         }
 
         public void AddItem(string characterId, string itemId, int quantity = 1, int slot = -1)
@@ -767,26 +780,32 @@ namespace RPG.Managers
         public void SaveGemLoadout(string characterId, PowerGemLoadout loadout)
         {
             if (string.IsNullOrWhiteSpace(characterId)) return;
-
             string charId = characterId;
             string q = loadout.SlotQ ?? "";
             string w = loadout.SlotW ?? "";
             string e = loadout.SlotE ?? "";
             string r = loadout.SlotR ?? "";
+            EnqueueWrite(() => SaveGemLoadoutInternal(charId, q, w, e, r));
+        }
 
-            EnqueueWrite(() =>
+        public void SaveGemLoadoutSync(string characterId, PowerGemLoadout loadout)
+        {
+            if (string.IsNullOrWhiteSpace(characterId)) return;
+            SaveGemLoadoutInternal(characterId, loadout.SlotQ ?? "", loadout.SlotW ?? "", loadout.SlotE ?? "", loadout.SlotR ?? "");
+        }
+
+        private void SaveGemLoadoutInternal(string charId, string q, string w, string e, string r)
+        {
+            try
             {
-                try
-                {
-                    lock (_dbLock)
-                        _db.InsertOrReplace(new GemLoadoutRow
-                        {
-                            CharacterId = charId,
-                            SlotQ = q, SlotW = w, SlotE = e, SlotR = r
-                        });
-                }
-                catch (Exception ex) { Debug.LogError($"[DB] SaveGemLoadout: {ex.Message}"); }
-            });
+                lock (_dbLock)
+                    _db.InsertOrReplace(new GemLoadoutRow
+                    {
+                        CharacterId = charId,
+                        SlotQ = q, SlotW = w, SlotE = e, SlotR = r
+                    });
+            }
+            catch (Exception ex) { Debug.LogError($"[DB] SaveGemLoadoutInternal: {ex.Message}"); }
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -812,37 +831,43 @@ namespace RPG.Managers
         public void SaveEquipped(string characterId, List<EquippedItemData> equipped)
         {
             if (string.IsNullOrWhiteSpace(characterId)) return;
-
             string charId = characterId;
             var copy = new List<EquippedItemData>(equipped);
+            EnqueueWrite(() => SaveEquippedInternal(charId, copy));
+        }
 
-            EnqueueWrite(() =>
+        public void SaveEquippedSync(string characterId, List<EquippedItemData> equipped)
+        {
+            if (string.IsNullOrWhiteSpace(characterId)) return;
+            SaveEquippedInternal(characterId, equipped);
+        }
+
+        private void SaveEquippedInternal(string charId, List<EquippedItemData> copy)
+        {
+            try
             {
-                try
+                lock (_dbLock)
                 {
-                    lock (_dbLock)
+                    _db.RunInTransaction(() =>
                     {
-                        _db.RunInTransaction(() =>
-                        {
-                            _db.Execute("DELETE FROM equipped_items WHERE character_id = ?", charId);
+                        _db.Execute("DELETE FROM equipped_items WHERE character_id = ?", charId);
 
-                            foreach (var item in copy)
+                        foreach (var item in copy)
+                        {
+                            if (string.IsNullOrEmpty(item.ItemId)) continue;
+                            _db.Insert(new EquippedItemRow
                             {
-                                if (string.IsNullOrEmpty(item.ItemId)) continue;
-                                _db.Insert(new EquippedItemRow
-                                {
-                                    CharacterId   = charId,
-                                    Slot          = item.Slot,
-                                    ItemId        = item.ItemId,
-                                    Durability    = item.Durability,
-                                    MaxDurability = item.MaxDurability
-                                });
-                            }
-                        });
-                    }
+                                CharacterId   = charId,
+                                Slot          = item.Slot,
+                                ItemId        = item.ItemId,
+                                Durability    = item.Durability,
+                                MaxDurability = item.MaxDurability
+                            });
+                        }
+                    });
                 }
-                catch (Exception e) { Debug.LogError($"[DB] SaveEquipped: {e.Message}"); }
-            });
+            }
+            catch (Exception e) { Debug.LogError($"[DB] SaveEquippedInternal: {e.Message}"); }
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -868,37 +893,43 @@ namespace RPG.Managers
         public void SaveQuestProgress(string characterId, List<QuestProgress> quests)
         {
             if (string.IsNullOrWhiteSpace(characterId)) return;
-
             string charId = characterId;
             var copy = new List<QuestProgress>(quests);
+            EnqueueWrite(() => SaveQuestProgressInternal(charId, copy));
+        }
 
-            EnqueueWrite(() =>
+        public void SaveQuestProgressSync(string characterId, List<QuestProgress> quests)
+        {
+            if (string.IsNullOrWhiteSpace(characterId)) return;
+            SaveQuestProgressInternal(characterId, quests);
+        }
+
+        private void SaveQuestProgressInternal(string charId, List<QuestProgress> copy)
+        {
+            try
             {
-                try
+                lock (_dbLock)
                 {
-                    lock (_dbLock)
+                    _db.RunInTransaction(() =>
                     {
-                        _db.RunInTransaction(() =>
-                        {
-                            _db.Execute("DELETE FROM quest_progress WHERE character_id = ?", charId);
+                        _db.Execute("DELETE FROM quest_progress WHERE character_id = ?", charId);
 
-                            foreach (var q in copy)
+                        foreach (var q in copy)
+                        {
+                            if (string.IsNullOrEmpty(q.QuestId)) continue;
+                            _db.Insert(new QuestProgressRow
                             {
-                                if (string.IsNullOrEmpty(q.QuestId)) continue;
-                                _db.Insert(new QuestProgressRow
-                                {
-                                    CharacterId    = charId,
-                                    QuestId        = q.QuestId,
-                                    State          = (int)q.State,
-                                    ProgressCsv    = q.ProgressCsv ?? "",
-                                    StateTimestamp = q.StateTimestamp
-                                });
-                            }
-                        });
-                    }
+                                CharacterId    = charId,
+                                QuestId        = q.QuestId,
+                                State          = (int)q.State,
+                                ProgressCsv    = q.ProgressCsv ?? "",
+                                StateTimestamp = q.StateTimestamp
+                            });
+                        }
+                    });
                 }
-                catch (Exception e) { Debug.LogError($"[DB] SaveQuestProgress: {e.Message}"); }
-            });
+            }
+            catch (Exception e) { Debug.LogError($"[DB] SaveQuestProgressInternal: {e.Message}"); }
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -971,15 +1002,20 @@ namespace RPG.Managers
         public List<CharacterData>   GetCharactersInMap(string m) => new List<CharacterData>();
         public string                TryCreateCharacter(string u, string n, CharacterRace r) => null;
         public void                  SaveCharacter(CharacterData ch, string u) { }
+        public void                  SaveCharacterSync(CharacterData ch, string u) { }
         public List<InventoryRow>    LoadInventory(string id) => new List<InventoryRow>();
         public void                  SaveInventory(string cid, string u, List<InventorySlotData> slots) { }
+        public void                  SaveInventorySync(string cid, string u, List<InventorySlotData> slots) { }
         public void                  AddItem(string id, string item, int qty = 1, int slot = -1) { }
         public PowerGemLoadout       LoadGemLoadout(string id) => new PowerGemLoadout();
         public void                  SaveGemLoadout(string id, PowerGemLoadout l) { }
+        public void                  SaveGemLoadoutSync(string id, PowerGemLoadout l) { }
         public List<EquippedItemRow> LoadEquipped(string id) => new List<EquippedItemRow>();
         public void                  SaveEquipped(string id, List<EquippedItemData> eq) { }
+        public void                  SaveEquippedSync(string id, List<EquippedItemData> eq) { }
         public List<QuestProgressRow> LoadQuestProgress(string id) => new List<QuestProgressRow>();
         public void                  SaveQuestProgress(string id, List<QuestProgress> q) { }
+        public void                  SaveQuestProgressSync(string id, List<QuestProgress> q) { }
         public void                  LogEconomy(string id, string ev, float v) { }
 #endif
     }

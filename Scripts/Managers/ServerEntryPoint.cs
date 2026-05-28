@@ -17,7 +17,11 @@ namespace RPG.Network
             if (currentScene == serverSceneName) return;
 
             Debug.Log($"[ServerEntryPoint] Servidor detectado. Carregando '{serverSceneName}'.");
-            SceneManager.LoadScene(serverSceneName);
+
+            if (Mirror.NetworkManager.singleton != null && Mirror.NetworkServer.active)
+                Mirror.NetworkManager.singleton.ServerChangeScene(serverSceneName);
+            else
+                SceneManager.LoadScene(serverSceneName);
         }
     }
 }

@@ -152,35 +152,33 @@ namespace RPG.Network
         // ══════════════════════════════════════════════════════════════════
 
         [Server]
+        private bool IsHibernating()
+        {
+            // Estados agressivos ou de fuga nunca hibernam para garantir que o monstro
+            // complete sua ação ou volte para casa corretamente.
+            if (_state == MonsterAIState.Chase || _state == MonsterAIState.Combat || _state == MonsterAIState.Flee)
+                return false;
+
+            float hibernationSqr = _hibernationRadius * _hibernationRadius;
+            foreach (var player in NetworkPlayer.All)
+            {
+                if (player != null && (player.transform.position - transform.position).sqrMagnitude < hibernationSqr)
+                    return false;
+            }
+
+            return true;
+        }
+
+        [Server]
         public void ServerTick(float deltaTime)
         {
             if (_entity.IsDead) return;
 
             // --- IA Hibernation Optimization ---
-            // Se o monstro não estiver em combate/chase, verifica se há players por perto
-            if (_state == MonsterAIState.Idle || _state == MonsterAIState.Patrol || _state == MonsterAIState.ReturnHome)
+            if (IsHibernating())
             {
-                bool anyPlayerNearby = false;
-                
-                // FIX: Usa a lista estática de players em vez de iterar todas as conexões,
-                // reduzindo drasticamente o overhead em servidores com muitas conexões inativas.
-                // Além disso, usa sqrMagnitude para evitar o custo de raiz quadrada.
-                float hibernationSqr = _hibernationRadius * _hibernationRadius;
-                foreach (var player in NetworkPlayer.All)
-                {
-                    if (player != null && (player.transform.position - transform.position).sqrMagnitude < hibernationSqr)
-                    {
-                        anyPlayerNearby = true;
-                        break;
-                    }
-                }
-
-                // Se não há players perto, pula o tick para economizar CPU
-                if (!anyPlayerNearby) 
-                {
-                    if (_agent != null && _agent.hasPath) _agent.ResetPath();
-                    return;
-                }
+                if (_agent != null && _agent.hasPath) _agent.ResetPath();
+                return;
             }
 
             _attackAccumulator += deltaTime;
@@ -210,7 +208,8 @@ namespace RPG.Network
                 if (this == null) yield break;
 
                 if (!_entity.IsDead
-                    && (_state == MonsterAIState.Idle || _state == MonsterAIState.Patrol))
+                    && (_state == MonsterAIState.Idle || _state == MonsterAIState.Patrol)
+                    && !IsHibernating())
                 {
                     if (_disposition == MonsterDisposition.Aggressive)
                         TryAggro();
@@ -265,7 +264,7 @@ namespace RPG.Network
             {
                 if (this == null) yield break;
 
-                if (!_entity.IsDead)
+                if (!_entity.IsDead && !IsHibernating())
                 {
                     switch (_state)
                     {

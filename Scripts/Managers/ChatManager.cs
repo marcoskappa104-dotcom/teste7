@@ -17,6 +17,9 @@ namespace RPG.Managers
         private readonly Dictionary<uint, float>  _lastMessageTimes = new Dictionary<uint, float>();
         private readonly Dictionary<uint, string> _lastMessages     = new Dictionary<uint, string>();
 
+        private static readonly System.Text.RegularExpressions.Regex _cleanTextRegex = 
+            new System.Text.RegularExpressions.Regex(@"[^\x20-\x7E\u00C0-\u00FF]", System.Text.RegularExpressions.RegexOptions.Compiled);
+
         private void Awake()
         {
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
@@ -65,7 +68,7 @@ namespace RPG.Managers
                 return;
             }
             // Remove caracteres de controle e invisíveis fora do range básico ASCII + Latin-1
-            cleanText = System.Text.RegularExpressions.Regex.Replace(cleanText, @"[^\x20-\x7E\u00C0-\u00FF]", "");
+            cleanText = _cleanTextRegex.Replace(cleanText, "");
             if (string.IsNullOrEmpty(cleanText)) return;
 
             // Monta a mensagem final

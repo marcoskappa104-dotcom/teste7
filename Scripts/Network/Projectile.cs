@@ -151,9 +151,13 @@ namespace RPG.Network
                     }
                 }
             }
-            else if (!ReferenceEquals(_serverTarget, null))
+            else
             {
+                // FIX: Fallback se o alvo sumir mid-flight (ex: despawn, desconexão)
+                // Em vez de voar pro nada, destruímos o projétil para evitar poluição visual e lógica.
                 _serverTarget = null;
+                NetworkServer.Destroy(gameObject);
+                return;
             }
 
             // Rotação clamped

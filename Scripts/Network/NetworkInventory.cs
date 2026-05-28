@@ -14,6 +14,14 @@ namespace RPG.Network
     [RequireComponent(typeof(NetworkIdentity))]
     public class NetworkInventory : NetworkBehaviour
     {
+        public override void OnStartServer()
+        {
+            // Otimização: Apenas o dono precisa saber o conteúdo do inventário.
+            // Isso reduz drasticamente o tráfego de rede e melhora a segurança.
+            syncMode = SyncMode.Owner;
+            base.OnStartServer();
+        }
+
         public const int MAX_INVENTORY_SLOTS = 60;
         public const int GEM_SLOT_COUNT      = 4;
 
@@ -100,29 +108,32 @@ namespace RPG.Network
         [Server]
         public int ServerAddItem(string itemId, int quantity = 1)
         {
-            if (string.IsNullOrEmpty(itemId)) return -1;
-            if (quantity <= 0) return -1;
+            if (string.IsNullOrEmpty(itemId)) return 0;
+            if (quantity <= 0) return 0;
 
             var db = ItemDatabase.Instance;
             if (db == null || !db.Contains(itemId))
             {
                 Debug.LogWarning($"[NetworkInventory] Item '{itemId}' não existe no banco.");
-                return -1;
+                return 0;
             }
 
             var item = db.GetItem(itemId);
-            if (item == null) return -1;
+            if (item == null) return 0;
 
             quantity = Mathf.Clamp(quantity, 1, ItemData.MAX_STACK_HARD_CAP * MAX_INVENTORY_SLOTS);
 
-            int result = item.IsStackable
+            int added = item.IsStackable
                 ? AddStackable(item, quantity)
                 : AddNonStackable(item, quantity);
 
-            if (result >= 0)
+            if (added > 0)
+            {
                 NotifyQuestCollectItem(itemId);
+                TryFlushPendingReturns();
+            }
 
-            return result;
+            return added;
         }
 
         [Server]
@@ -184,8 +195,7 @@ namespace RPG.Network
         [Server]
         private int AddNonStackable(ItemData item, int quantity)
         {
-            int firstAffected = -1;
-            int added         = 0;
+            int added = 0;
 
             for (int i = 0; i < quantity; i++)
             {
@@ -196,7 +206,7 @@ namespace RPG.Network
                     if (added > 0 && added < quantity && _netPlayer != null)
                         RpcNotifyPartialPickup(item.ItemId, added, quantity);
 
-                    return firstAffected;
+                    return added;
                 }
 
                 var slot = new InventorySlotData
@@ -207,19 +217,16 @@ namespace RPG.Network
                 };
                 Slots.Add(slot);
                 added++;
-
-                if (firstAffected < 0) firstAffected = slot.SlotIndex;
             }
 
-            return firstAffected;
+            return added;
         }
 
         [Server]
         private int AddStackable(ItemData item, int quantity)
         {
-            int maxStack      = item.EffectiveMaxStack;
-            int remaining     = quantity;
-            int firstAffected = -1;
+            int maxStack  = item.EffectiveMaxStack;
+            int remaining = quantity;
 
             // Fase 1: topar stacks existentes
             for (int i = 0; i < Slots.Count && remaining > 0; i++)
@@ -235,8 +242,6 @@ namespace RPG.Network
                 Slots[i]       = slot;
 
                 remaining -= toAdd;
-
-                if (firstAffected < 0) firstAffected = slot.SlotIndex;
             }
 
             // Fase 2: criar novos stacks
@@ -251,7 +256,7 @@ namespace RPG.Network
                     if (collected > 0 && _netPlayer != null)
                         RpcNotifyPartialPickup(item.ItemId, collected, quantity);
 
-                    return firstAffected;
+                    return collected;
                 }
 
                 int amountForNewSlot = Mathf.Min(maxStack, remaining);
@@ -265,11 +270,9 @@ namespace RPG.Network
                 Slots.Add(newSlot);
 
                 remaining -= amountForNewSlot;
-
-                if (firstAffected < 0) firstAffected = newSlot.SlotIndex;
             }
 
-            return firstAffected;
+            return quantity;
         }
 
         [TargetRpc]
@@ -291,6 +294,7 @@ namespace RPG.Network
                     if (!string.IsNullOrEmpty(removedItemId))
                         NotifyQuestCollectItem(removedItemId);
 
+                    TryFlushPendingReturns();
                     return true;
                 }
             }
@@ -306,6 +310,7 @@ namespace RPG.Network
                 {
                     Slots.RemoveAt(i);
                     NotifyQuestCollectItem(itemId);
+                    TryFlushPendingReturns();
                     return true;
                 }
             }
@@ -443,21 +448,48 @@ namespace RPG.Network
         }
 
         [Server]
+        public void ServerSaveAllSync(string characterId, string username)
+        {
+            var db = Managers.DatabaseManager.Instance;
+            if (db == null) return;
+
+            TryFlushPendingReturns();
+
+            db.SaveInventorySync(characterId, username, new List<InventorySlotData>(Slots));
+            db.SaveGemLoadoutSync(characterId, new PowerGemLoadout
+            {
+                SlotQ = GemSlotQ ?? "", SlotW = GemSlotW ?? "",
+                SlotE = GemSlotE ?? "", SlotR = GemSlotR ?? ""
+            });
+            db.SaveEquippedSync(characterId, new List<EquippedItemData>(EquippedItems));
+        }
+
+        private bool _isFlushingPending;
+
+        [Server]
         private void TryFlushPendingReturns()
         {
-            if (_pendingReturns.Count == 0) return;
+            if (_isFlushingPending || _pendingReturns.Count == 0) return;
 
-            for (int i = _pendingReturns.Count - 1; i >= 0; i--)
+            _isFlushingPending = true;
+            try
             {
-                var (itemId, qty) = _pendingReturns[i];
-                int added = ServerAddItem(itemId, qty);
-                if (added >= 0)
+                for (int i = _pendingReturns.Count - 1; i >= 0; i--)
                 {
-                    _pendingReturns.RemoveAt(i);
-                    var item = ItemDatabase.Instance?.GetItem(itemId);
-                    string name = item?.DisplayName ?? itemId;
-                    _netPlayer?.RpcShowMessageToOwner($"Item devolvido: {name} ×{qty}");
+                    var (itemId, qty) = _pendingReturns[i];
+                    int added = ServerAddItem(itemId, qty);
+                    if (added > 0)
+                    {
+                        _pendingReturns.RemoveAt(i);
+                        var item = ItemDatabase.Instance?.GetItem(itemId);
+                        string name = item?.DisplayName ?? itemId;
+                        _netPlayer?.RpcShowMessageToOwner($"Item devolvido: {name} ×{qty}");
+                    }
                 }
+            }
+            finally
+            {
+                _isFlushingPending = false;
             }
         }
 
@@ -508,7 +540,7 @@ namespace RPG.Network
             if (!string.IsNullOrEmpty(oldItemId))
             {
                 int returnedSlot = ServerAddItem(oldItemId, 1);
-                if (returnedSlot < 0)
+                if (returnedSlot == 0)
                 {
                     Debug.LogError($"[NetworkInventory] CAMINHO CATASTRÓFICO: " +
                                    $"oldItem '{oldItemId}' não pôde ser devolvido após validação. " +
@@ -618,7 +650,7 @@ namespace RPG.Network
             }
 
             int returnedSlot = ServerAddItem(itemId, 1);
-            if (returnedSlot < 0)
+            if (returnedSlot == 0)
             {
                 _netPlayer.RpcShowMessageToOwner("Inventário cheio!");
                 return;
@@ -857,7 +889,7 @@ namespace RPG.Network
             if (string.IsNullOrEmpty(gemId)) return;
 
             int newSlot = ServerAddItem(gemId, 1);
-            if (newSlot < 0)
+            if (newSlot == 0)
             {
                 _netPlayer.RpcShowMessageToOwner("Inventário cheio!");
                 return;

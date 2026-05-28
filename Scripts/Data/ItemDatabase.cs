@@ -6,19 +6,49 @@ namespace RPG.Data
 
     public class ItemDatabase : MonoBehaviour
     {
-        public static ItemDatabase Instance { get; private set; }
+        private static ItemDatabase _instance;
+        public static ItemDatabase Instance
+        {
+            get
+            {
+                if (_instance == null)
+                {
+                    _instance = FindFirstObjectByType<ItemDatabase>();
+                    if (_instance != null) _instance.InitializeIfRequired();
+                }
+                return _instance;
+            }
+        }
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        private static void InitializeOnLoad()
+        {
+            // Tenta garantir que a instância seja encontrada cedo
+            if (_instance == null)
+                _instance = FindFirstObjectByType<ItemDatabase>();
+            
+            _instance?.InitializeIfRequired();
+        }
 
         [Header("Registre TODOS os itens do jogo aqui")]
         [SerializeField] private List<ItemData> allItems = new List<ItemData>();
 
         private readonly Dictionary<string, ItemData> _lookup = new Dictionary<string, ItemData>();
+        private bool _initialized;
 
         private void Awake()
         {
-            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
-            Instance = this;
+            if (_instance != null && _instance != this) { Destroy(gameObject); return; }
+            _instance = this;
             DontDestroyOnLoad(gameObject);
+            InitializeIfRequired();
+        }
+
+        private void InitializeIfRequired()
+        {
+            if (_initialized) return;
             BuildLookup();
+            _initialized = true;
         }
 
         private void BuildLookup()

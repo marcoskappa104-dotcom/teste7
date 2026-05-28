@@ -9,19 +9,48 @@ namespace RPG.Quest
     /// </summary>
     public class QuestDatabase : MonoBehaviour
     {
-        public static QuestDatabase Instance { get; private set; }
+        private static QuestDatabase _instance;
+        public static QuestDatabase Instance
+        {
+            get
+            {
+                if (_instance == null)
+                {
+                    _instance = FindFirstObjectByType<QuestDatabase>();
+                    if (_instance != null) _instance.InitializeIfRequired();
+                }
+                return _instance;
+            }
+        }
+
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        private static void InitializeOnLoad()
+        {
+            if (_instance == null)
+                _instance = FindFirstObjectByType<QuestDatabase>();
+
+            _instance?.InitializeIfRequired();
+        }
 
         [Header("Registre TODAS as quests do jogo aqui")]
         [SerializeField] private List<QuestDefinition> allQuests = new List<QuestDefinition>();
 
         private readonly Dictionary<string, QuestDefinition> _lookup = new Dictionary<string, QuestDefinition>();
+        private bool _initialized;
 
         private void Awake()
         {
-            if (Instance != null && Instance != this) { Destroy(gameObject); return; }
-            Instance = this;
+            if (_instance != null && _instance != this) { Destroy(gameObject); return; }
+            _instance = this;
             DontDestroyOnLoad(gameObject);
+            InitializeIfRequired();
+        }
+
+        private void InitializeIfRequired()
+        {
+            if (_initialized) return;
             BuildLookup();
+            _initialized = true;
         }
 
         private void BuildLookup()

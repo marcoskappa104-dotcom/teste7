@@ -35,6 +35,27 @@ namespace RPG.Network
             _isDirty = false;
         }
 
+        [Server]
+        public void ServerSaveCharacterSync()
+        {
+            if (_serverCharData == null) return;
+            if (string.IsNullOrEmpty(_serverCharData.CharacterId)) return;
+            if (string.IsNullOrEmpty(_serverAccountUsername)) return;
+
+            // Snapshot de estado atual para o banco
+            _serverCharData.CurrentHP = CurrentHP;
+            _serverCharData.CurrentMP = CurrentMP;
+            _serverCharData.PosX      = transform.position.x;
+            _serverCharData.PosY      = transform.position.y;
+            _serverCharData.PosZ      = transform.position.z;
+
+            DatabaseManager.Instance?.SaveCharacterSync(_serverCharData, _serverAccountUsername);
+            _inventory?.ServerSaveAllSync(_serverCharData.CharacterId, _serverAccountUsername);
+            _questManager?.ServerSaveAllSync();
+
+            _isDirty = false;
+        }
+
         [Server] 
         public void ServerSaveCharacter() => ServerSaveCharacterForced();
     }

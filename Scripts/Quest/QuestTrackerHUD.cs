@@ -109,7 +109,7 @@ namespace RPG.UI
 
                     bool done = arr[o] >= obj.TargetCount;
                     string color = done ? "#88FF88" : "#CCCCCC";
-                    string mark  = done ? "✓" : "•";
+                    string mark  = done ? "[v]" : "•";
                     _sb.AppendLine($"  <color={color}>{mark} {obj.FormatDescription(arr[o])}</color>");
                 }
             }

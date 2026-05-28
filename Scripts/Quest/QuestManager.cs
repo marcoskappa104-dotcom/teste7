@@ -342,20 +342,25 @@ namespace RPG.Quest
             // Ordena por timestamp crescente — as mais antigas vêm primeiro.
             completedIndices.Sort((a, b) => a.timestamp.CompareTo(b.timestamp));
 
-            // Remove as N mais antigas. ATENÇÃO: remover por índice direto
-            // invalida os outros índices coletados. Solução: coletamos os
-            // QuestIds das que devem ser removidas e usamos FindIndexById
-            // a cada remoção (mais defensivo, custo aceitável pois `over`
-            // é pequeno por design — só estouramos cap em casos extremos).
-            int toRemove = Mathf.Min(over, completedIndices.Count);
-            int removed = 0;
+            // Remove as N mais antigas. 
+            // FIX (Lote 4): Para evitar FindIndexById O(n) dentro do loop, 
+            // coletamos os QuestIds que devem sair, e removemos de trás pra frente
+            // na lista original de Quests se o ID bater, ou usamos uma estratégia 
+            // de remoção em lote se possível. 
+            // Dado que SyncList não permite remoção em lote eficiente por ID, 
+            // a melhor forma performática é identificar os IDs e fazer uma única 
+            // passada reversa na SyncList.
+            int toRemoveCount = Mathf.Min(over, completedIndices.Count);
+            var idsToRemove = new HashSet<string>();
+            for (int i = 0; i < toRemoveCount; i++)
+                idsToRemove.Add(completedIndices[i].questId);
 
-            for (int i = 0; i < toRemove; i++)
+            int removed = 0;
+            for (int i = Quests.Count - 1; i >= 0 && removed < toRemoveCount; i--)
             {
-                int liveIdx = FindIndexById(completedIndices[i].questId);
-                if (liveIdx >= 0)
+                if (idsToRemove.Contains(Quests[i].QuestId))
                 {
-                    Quests.RemoveAt(liveIdx);
+                    Quests.RemoveAt(i);
                     removed++;
                 }
             }
@@ -585,6 +590,17 @@ namespace RPG.Quest
 
             var snapshot = new List<QuestProgress>(Quests);
             db.SaveQuestProgress(_serverCharacterId, snapshot);
+        }
+
+        [Server]
+        public void ServerSaveAllSync()
+        {
+            if (string.IsNullOrEmpty(_serverCharacterId)) return;
+            var db = DatabaseManager.Instance;
+            if (db == null) return;
+
+            var snapshot = new List<QuestProgress>(Quests);
+            db.SaveQuestProgressSync(_serverCharacterId, snapshot);
         }
 
         // ══════════════════════════════════════════════════════════════════

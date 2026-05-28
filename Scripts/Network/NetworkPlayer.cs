@@ -97,6 +97,7 @@ namespace RPG.Network
         private float         _autoSaveTimer;
         private float         _lastAllocateTime         = -999f;
         private bool          _isDirty;
+        private float         _serverImmunityTimer;
 
         public DerivedStats ServerStats => _serverStats;
 
@@ -147,7 +148,7 @@ namespace RPG.Network
                 _regenLoop.OnRegenTick -= OnServerRegenTick;
 
             if (_serverCharData != null && !string.IsNullOrEmpty(_serverAccountUsername))
-                ServerSaveCharacterForced();
+                ServerSaveCharacterSync();
         }
 
         public override void OnStartClient()
@@ -209,6 +210,8 @@ namespace RPG.Network
         [Server]
         private void ServerUpdate()
         {
+            if (_serverImmunityTimer > 0f) _serverImmunityTimer -= Time.deltaTime;
+
             _autoSaveTimer -= Time.deltaTime;
             if (_autoSaveTimer <= 0f)
             {

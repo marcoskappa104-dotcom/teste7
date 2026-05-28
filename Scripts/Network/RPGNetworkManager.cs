@@ -71,7 +71,8 @@ namespace RPG.Network
 
         // Tracking de connIds cancelados durante a coroutine de spawn — usado
         // como sinal de "essa coroutine deve abortar".
-        private readonly HashSet<int> _cancelledSpawns = new();
+        private readonly HashSet<int> _cancelledSpawns      = new HashSet<int>();
+        private readonly Queue<int>   _cancelledSpawnsQueue = new Queue<int>();
 
         private Coroutine _cleanupCoroutine;
 
@@ -151,13 +152,14 @@ namespace RPG.Network
         {
             base.OnStartServer();
 
-            // Adiciona Interest Management (Spatial Hashing) programaticamente se não houver um
+            // FIX: Adiciona Interest Management programaticamente. 
+            // DICA: Para melhor performance, configure isso diretamente no prefab do NetworkManager no Editor.
             if (GetComponent<InterestManagement>() == null)
             {
                 var spatial = gameObject.AddComponent<SpatialHashingInterestManagement>();
                 spatial.visRange = 60; // Range de visão do jogador
                 spatial.rebuildInterval = 0.5f; // Frequência de atualização (2x por segundo)
-                Debug.Log("[RPGNetworkManager] Interest Management (Spatial Hashing) configurado.");
+                Debug.Log("[RPGNetworkManager] Interest Management (Spatial Hashing) configurado via código.");
             }
 
             if (playerPrefab == null)
@@ -193,6 +195,7 @@ namespace RPG.Network
             _spawnCoroutines.Clear();
             _pendingSpawns.Clear();
             _cancelledSpawns.Clear();
+            _cancelledSpawnsQueue.Clear();
 
             if (_cleanupCoroutine != null)
             {
@@ -257,32 +260,26 @@ namespace RPG.Network
 
         /// <summary>
         /// Adiciona connId ao set de cancelados, drenando entradas antigas
-        /// se atingir o cap. Garante crescimento limitado mesmo em cenários
-        /// patológicos (botnet de conexões/desconexões).
+        /// se atingir o cap. Usa uma Queue para garantir semântica LRU (Least Recently Used)
+        /// na drenagem.
         /// </summary>
         private void AddCancelledSpawn(int connId)
         {
+            if (_cancelledSpawns.Contains(connId)) return;
+
             if (_cancelledSpawns.Count >= MAX_TRACKED_CANCELLED)
             {
-                // Drena metade — não importa qual metade porque connIds órfãos
-                // não têm uso prático além de serem checados pela coroutine.
-                int toRemove = _cancelledSpawns.Count / 2;
-                int removed  = 0;
-                var enumerator = _cancelledSpawns.GetEnumerator();
-                var toRemoveList = new List<int>(toRemove);
-                while (enumerator.MoveNext() && removed < toRemove)
+                // Remove o mais antigo que ainda estiver no set
+                while (_cancelledSpawnsQueue.Count > 0)
                 {
-                    toRemoveList.Add(enumerator.Current);
-                    removed++;
+                    int oldest = _cancelledSpawnsQueue.Dequeue();
+                    if (_cancelledSpawns.Remove(oldest))
+                        break; 
                 }
-                foreach (var id in toRemoveList)
-                    _cancelledSpawns.Remove(id);
-
-                Debug.LogWarning($"[RPGNetworkManager] _cancelledSpawns atingiu cap " +
-                                 $"({MAX_TRACKED_CANCELLED}). Drenadas {removed} entradas antigas.");
             }
 
             _cancelledSpawns.Add(connId);
+            _cancelledSpawnsQueue.Enqueue(connId);
         }
 
         public override void OnServerAddPlayer(NetworkConnectionToClient conn) { }

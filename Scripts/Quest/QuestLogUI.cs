@@ -228,7 +228,7 @@ namespace RPG.UI
                 if (obj == null) continue;
                 bool done = arr[i] >= obj.TargetCount;
                 string color = done ? "#88FF88" : "#FFFFFF";
-                string check = done ? "✓ " : "• ";
+                string check = done ? "[v] " : "• ";
                 sb.AppendLine($"<color={color}>{check}{obj.FormatDescription(arr[i])}</color>");
             }
             return sb.ToString().TrimEnd();

@@ -40,6 +40,23 @@ namespace RPG.UI
         private readonly List<ActiveText> _activeTexts = new List<ActiveText>();
         private readonly Queue<ActiveText> _activeTextPool = new Queue<ActiveText>();
 
+        // Agrupamento de dano
+        private struct DamageGroupKey
+        {
+            public Vector3 Pos;
+            public Color   Col;
+            public override int GetHashCode() => Pos.GetHashCode() ^ Col.GetHashCode();
+            public override bool Equals(object obj) => obj is DamageGroupKey other && Pos == other.Pos && Col == other.Col;
+        }
+        private class DamageGroup
+        {
+            public float  Value;
+            public float  TimeRemaining;
+            public string Prefix = "";
+        }
+        private readonly Dictionary<DamageGroupKey, DamageGroup> _damageGroups = new Dictionary<DamageGroupKey, DamageGroup>();
+        private const float GROUP_WINDOW = 0.2f; // 200ms
+
         private void Awake()
         {
             if (Instance != null && Instance != this) { Destroy(gameObject); return; }
@@ -71,9 +88,28 @@ namespace RPG.UI
 
         private void Update()
         {
-            if (_isServerOnly || _activeTexts.Count == 0) return;
+            if (_isServerOnly) return;
 
             float dt = Time.deltaTime;
+
+            // Processa grupos de dano
+            if (_damageGroups.Count > 0)
+            {
+                var keys = new List<DamageGroupKey>(_damageGroups.Keys);
+                foreach (var key in keys)
+                {
+                    var group = _damageGroups[key];
+                    group.TimeRemaining -= dt;
+                    if (group.TimeRemaining <= 0)
+                    {
+                        ShowImmediate($"{group.Prefix}{Mathf.RoundToInt(group.Value)}", key.Pos, key.Col);
+                        _damageGroups.Remove(key);
+                    }
+                }
+            }
+
+            if (_activeTexts.Count == 0) return;
+
             for (int i = _activeTexts.Count - 1; i >= 0; i--)
             {
                 var at = _activeTexts[i];
@@ -143,8 +179,37 @@ namespace RPG.UI
         public void Show(string text, Vector3 worldPos, Color color)
         {
             if (_isServerOnly || Application.isBatchMode) return;
-            if (floatingTextPrefab == null) return;
 
+            // Tenta agrupar se for um número (dano/cura)
+            if (float.TryParse(text, out float val))
+            {
+                // Arredonda a posição para agrupar hits no mesmo alvo
+                Vector3 snappedPos = new Vector3(
+                    Mathf.Round(worldPos.x * 10f) / 10f,
+                    Mathf.Round(worldPos.y * 10f) / 10f,
+                    Mathf.Round(worldPos.z * 10f) / 10f
+                );
+
+                var key = new DamageGroupKey { Pos = snappedPos, Col = color };
+                if (!_damageGroups.TryGetValue(key, out var group))
+                {
+                    group = new DamageGroup { Value = val, TimeRemaining = GROUP_WINDOW };
+                    _damageGroups[key] = group;
+                }
+                else
+                {
+                    group.Value += val;
+                    group.TimeRemaining = GROUP_WINDOW; // Reset window
+                }
+                return;
+            }
+
+            ShowImmediate(text, worldPos, color);
+        }
+
+        private void ShowImmediate(string text, Vector3 worldPos, Color color)
+        {
+            if (floatingTextPrefab == null) return;
             if (_cachedCamera == null) _cachedCamera = Camera.main;
 
             PoolEntry entry = _pool.Count > 0 ? _pool.Dequeue() : CreateEntry();

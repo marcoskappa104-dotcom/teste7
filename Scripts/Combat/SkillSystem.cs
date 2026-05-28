@@ -156,13 +156,13 @@ namespace RPG.Combat
 
         private void OnPlayerTargetChanged(ITargetable newTarget)
         {
-            if (_hasPendingWalk && _pendingTarget != null && newTarget != _pendingTarget)
+            if (_hasPendingWalk && newTarget != _pendingTarget)
             {
                 Log("Alvo mudou durante walk-to-skill — cancelando.");
                 CancelPendingWalkSoft();
             }
 
-            if (_isCasting && _castTarget != null && newTarget != _castTarget)
+            if ((_isCasting || _castCoroutine != null) && _castTarget != null && newTarget != _castTarget)
             {
                 Log("Alvo mudou durante cast — cancelando.");
                 CancelCast();
@@ -385,6 +385,15 @@ namespace RPG.Combat
                     cancelled = true;
                     break;
                 }
+
+                // ARPG-style: mover interrompe o cast
+                if (_agent != null && _agent.hasPath && _agent.velocity.sqrMagnitude > 0.1f)
+                {
+                    Log("Cast cancelado: jogador se moveu.");
+                    cancelled = true;
+                    break;
+                }
+
                 if (!isSelf && !IsTargetValid(target))
                 {
                     Log("Cast cancelado: alvo morreu.");

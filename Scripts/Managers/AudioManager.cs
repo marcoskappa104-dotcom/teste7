@@ -55,12 +55,26 @@ namespace RPG.Managers
         {
             if (clip == null) return;
 
+            if (_sourcePool.Count == 0)
+            {
+                // Se o pool esvaziou, tentamos pegar um que já terminou de tocar
+                // mas que ainda não foi devolvido (fallback de segurança)
+                Debug.LogWarning("[AudioManager] Pool de áudio esgotado. Considere aumentar _poolSize.");
+                return;
+            }
+
             var source = _sourcePool.Dequeue();
             source.clip   = clip;
             source.volume = volume;
             source.pitch  = pitch;
             source.Play();
 
+            StartCoroutine(ReturnToPool(source, clip.length / Mathf.Abs(pitch)));
+        }
+
+        private System.Collections.IEnumerator ReturnToPool(AudioSource source, float delay)
+        {
+            yield return new WaitForSeconds(delay);
             _sourcePool.Enqueue(source);
         }
 

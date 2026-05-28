@@ -301,19 +301,27 @@ namespace RPG.Network
                 return;
             }
 
-            // Tenta adicionar — pode falhar por inventário cheio
-            int slotIndex = inventory.ServerAddItem(_itemId, _quantity);
-            if (slotIndex < 0)
+            // Tenta adicionar — pode falhar por inventário cheio ou coletar parcial
+            int actuallyTaken = inventory.ServerAddItem(_itemId, _quantity);
+            if (actuallyTaken <= 0)
             {
                 _picked = false;
                 return;
             }
 
-            // ── SUCESSO GARANTIDO DAQUI PRA BAIXO ─────────────────────────
             // Se coletou apenas parte (ex: inventário encheu no meio do stack),
-            // a quantidade restante deveria ficar no chão, mas por simplicidade
-            // aqui tratamos como sucesso se pelo menos 1 foi coletado.
-            // O ServerAddItem do NetworkInventory já cuida de notificar se foi parcial.
+            // a quantidade restante continua no chão.
+            if (actuallyTaken < _quantity)
+            {
+                _quantity -= actuallyTaken;
+                _picked    = false; // Permite que seja coletado de novo
+
+                // Feedback visual/sonoro de coleta parcial se necessário
+                // Aqui apenas atualizamos a SyncVar _quantity, o que deve refletir no visual se houver label
+                return;
+            }
+
+            // ── SUCESSO TOTAL DAQUI PRA BAIXO ────────────────────────────
 
             if (_despawnCoroutine != null)
             {
