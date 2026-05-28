@@ -98,7 +98,6 @@ namespace RPG.Network
         private MonsterVisualFader   _fader;
 
         // ── Estado ─────────────────────────────────────────────────────────
-        private bool    _serverResetDone;
         private float   _lastIsMovingUpdateTime;
 
         private GameObject            _monsterPrefab;
@@ -181,20 +180,14 @@ namespace RPG.Network
 
             _deathHandler?.ConfigureRespawn(_spawner, _monsterPrefab, _homePosition, _patrolRadius);
 
-            StartCoroutine(ServerResetNextFrame());
-        }
-
-        [Server]
-        private IEnumerator ServerResetNextFrame()
-        {
-            yield return null;
-            if (!_serverResetDone) ServerReset();
+            // FIX (Bug 13): Chama ServerReset diretamente em vez de coroutine/update buffer.
+            // Isso garante que o monstro esteja em estado válido imediatamente após o spawn.
+            ServerReset();
         }
 
         [Server]
         private void ServerReset()
         {
-            _serverResetDone = true;
             _maxHP           = Stats.MaxHP;
             _currentHP       = _maxHP;
             _isDead          = false;
@@ -241,7 +234,6 @@ namespace RPG.Network
         private void Update()
         {
             if (!isServer) return;
-            if (!_serverResetDone) { ServerReset(); return; }
             if (_isDead) return;
 
             // Sincroniza estado de movimento com frequência reduzida

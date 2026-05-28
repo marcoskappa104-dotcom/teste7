@@ -98,6 +98,7 @@ namespace RPG.Network
         private float         _lastAllocateTime         = -999f;
         private bool          _isDirty;
         private float         _serverImmunityTimer;
+        private float         _serverDeathTimer; // FIX (Bug 5): Fallback de respawn automático
 
         public DerivedStats ServerStats => _serverStats;
 
@@ -211,6 +212,21 @@ namespace RPG.Network
         private void ServerUpdate()
         {
             if (_serverImmunityTimer > 0f) _serverImmunityTimer -= Time.deltaTime;
+
+            if (Dead)
+            {
+                _serverDeathTimer += Time.deltaTime;
+                // Auto-respawn após 60 segundos se o cliente não solicitar
+                if (_serverDeathTimer >= 60f)
+                {
+                    _serverDeathTimer = 0f;
+                    ServerRespawn();
+                }
+            }
+            else
+            {
+                _serverDeathTimer = 0f;
+            }
 
             _autoSaveTimer -= Time.deltaTime;
             if (_autoSaveTimer <= 0f)
@@ -351,13 +367,23 @@ namespace RPG.Network
 
         private void OnNetMaxHPChanged(float _, float newMax)
         {
-            if (_hpBarSlider != null) { _hpBarSlider.maxValue = Mathf.Max(1f, newMax); if (_hpBarSlider.value > newMax) _hpBarSlider.value = newMax; }
+            if (_hpBarSlider != null) 
+            { 
+                _hpBarSlider.maxValue = Mathf.Max(1f, newMax); 
+                // FIX (Bug 8): Garante que o valor da barra não exceda o novo máximo imediatamente
+                _hpBarSlider.value = Mathf.Min(_hpBarSlider.value, _hpBarSlider.maxValue);
+            }
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized) _playerEntity.SetHPFromServer(CurrentHP, newMax);
         }
 
         private void OnNetHPChanged(float _, float newHP)
         {
-            if (_hpBarSlider != null) { _hpBarSlider.maxValue = Mathf.Max(1f, MaxHP); _hpBarSlider.value = Mathf.Clamp(newHP, 0f, _hpBarSlider.maxValue); _hpBarSlider.gameObject.SetActive(newHP < MaxHP); }
+            if (_hpBarSlider != null) 
+            { 
+                _hpBarSlider.maxValue = Mathf.Max(1f, MaxHP); 
+                _hpBarSlider.value = Mathf.Clamp(newHP, 0f, _hpBarSlider.maxValue); 
+                _hpBarSlider.gameObject.SetActive(newHP < MaxHP); 
+            }
             if (isLocalPlayer && _playerEntity != null && _playerEntity.IsInitialized) _playerEntity.SetHPFromServer(newHP, MaxHP);
         }
 

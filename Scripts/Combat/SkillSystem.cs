@@ -240,6 +240,13 @@ namespace RPG.Combat
                 return;
             }
 
+            // FIX (Bug 3): Validação de MP no cliente antes de iniciar cast
+            if (_player.CurrentMP < skill.ManaCost)
+            {
+                UIManager.Instance?.ShowMessage("<color=red>MP insuficiente para usar esta habilidade!</color>");
+                return;
+            }
+
             if (IsOnUICooldown(index))
             {
                 UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(index):0.0}s");

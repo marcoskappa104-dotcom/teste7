@@ -371,8 +371,9 @@ namespace RPG.Data
         }
 
         /// <summary>
-        /// Rola acerto. Quando hit e flee são 0, usa 50% base
-        /// (evita NaN da divisão 0/0).
+        /// Rola acerto. Quando hit e flee são 0, usa 50% base.
+        /// FIX (Bug 12): Cap de 95% removido. Agora permite acerto/esquiva 
+        /// garantida se a discrepância for extrema.
         /// </summary>
         public static bool RollHit(float hit, float flee, System.Random rng = null)
         {
@@ -385,7 +386,8 @@ namespace RPG.Data
             else
             {
                 float total = hit + flee;
-                hitChance = Mathf.Clamp((hit / total) * 100f, 5f, 95f);
+                // Cap mínimo de 1% para evitar que um jogador nunca acerte (mesmo com 1 de hit vs 1M de flee)
+                hitChance = Mathf.Clamp((hit / total) * 100f, 1f, 100f);
             }
 
             float roll = rng != null

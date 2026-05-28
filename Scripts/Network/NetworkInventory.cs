@@ -497,72 +497,88 @@ namespace RPG.Network
         // SWAP HELPER
         // ══════════════════════════════════════════════════════════════════
 
+        private bool _isProcessingEquip;
+
         [Server]
         private bool TrySwapFromInventory(int inventorySlotIndex, string newItemId,
                                           string oldItemId, out string failReason)
         {
             failReason = null;
 
-            if (!TryGetInventorySlot(inventorySlotIndex, out var originalSlot))
+            if (_isProcessingEquip)
             {
-                failReason = "Item desapareceu do inventário.";
+                failReason = "Aguarde o processamento do equipamento anterior.";
                 return false;
             }
 
-            if (!string.IsNullOrEmpty(oldItemId))
+            _isProcessingEquip = true;
+            try
             {
-                int hypotheticalFreeSlots = MAX_INVENTORY_SLOTS - Slots.Count + 1;
-
-                var oldItem = ItemDatabase.Instance?.GetItem(oldItemId);
-                if (oldItem == null)
+                if (!TryGetInventorySlot(inventorySlotIndex, out var originalSlot))
                 {
-                    Debug.LogError($"[NetworkInventory] oldItemId '{oldItemId}' não encontrado no banco. " +
-                                   "Equip prossegue mas item antigo não será devolvido.");
+                    failReason = "Item desapareceu do inventário.";
+                    return false;
                 }
-                else
+
+                if (!string.IsNullOrEmpty(oldItemId))
                 {
-                    if (!oldItem.IsStackable && hypotheticalFreeSlots < 1)
+                    int hypotheticalFreeSlots = MAX_INVENTORY_SLOTS - Slots.Count + 1;
+
+                    var oldItem = ItemDatabase.Instance?.GetItem(oldItemId);
+                    if (oldItem == null)
                     {
-                        failReason = "Sem espaço no inventário para o item antigo.";
-                        return false;
-                    }
-                }
-            }
-
-            if (!ServerRemoveSlot(inventorySlotIndex))
-            {
-                failReason = "Item desapareceu do inventário.";
-                Debug.LogError($"[NetworkInventory] TrySwapFromInventory: " +
-                               $"remove({inventorySlotIndex}) falhou inesperadamente.");
-                return false;
-            }
-
-            if (!string.IsNullOrEmpty(oldItemId))
-            {
-                int returnedSlot = ServerAddItem(oldItemId, 1);
-                if (returnedSlot == 0)
-                {
-                    Debug.LogError($"[NetworkInventory] CAMINHO CATASTRÓFICO: " +
-                                   $"oldItem '{oldItemId}' não pôde ser devolvido após validação. " +
-                                   $"Adicionando ao purgatório. " +
-                                   $"Player: {_netPlayer?.CharacterName ?? "?"}");
-
-                    if (_pendingReturns.Count < MAX_PENDING_RETURNS)
-                    {
-                        _pendingReturns.Add((oldItemId, 1));
-                        _netPlayer?.RpcShowMessageToOwner(
-                            "Aviso: item antigo será devolvido assim que houver espaço.");
+                        Debug.LogError($"[NetworkInventory] oldItemId '{oldItemId}' não encontrado no banco. " +
+                                       "Equip prossegue mas item antigo não será devolvido.");
                     }
                     else
                     {
-                        Debug.LogError($"[NetworkInventory] PURGATÓRIO CHEIO! Item '{oldItemId}' PERDIDO.");
-                        _netPlayer?.RpcShowMessageToOwner(
-                            "<color=red>Erro: Purgatório cheio! O item antigo foi perdido!</color>");
+                        if (!oldItem.IsStackable && hypotheticalFreeSlots < 1)
+                        {
+                            failReason = "Sem espaço no inventário para o item antigo.";
+                            return false;
+                        }
                     }
                 }
-            }
 
-            return true;
+                if (!ServerRemoveSlot(inventorySlotIndex))
+                {
+                    failReason = "Item desapareceu do inventário.";
+                    Debug.LogError($"[NetworkInventory] TrySwapFromInventory: " +
+                                   $"remove({inventorySlotIndex}) falhou inesperadamente.");
+                    return false;
+                }
+
+                if (!string.IsNullOrEmpty(oldItemId))
+                {
+                    int returnedSlot = ServerAddItem(oldItemId, 1);
+                    if (returnedSlot == 0)
+                    {
+                        Debug.LogError($"[NetworkInventory] CAMINHO CATASTRÓFICO: " +
+                                       $"oldItem '{oldItemId}' não pôde ser devolvido após validação. " +
+                                       $"Adicionando ao purgatório. " +
+                                       $"Player: {_netPlayer?.CharacterName ?? "?"}");
+
+                        if (_pendingReturns.Count < MAX_PENDING_RETURNS)
+                        {
+                            _pendingReturns.Add((oldItemId, 1));
+                            _netPlayer?.RpcShowMessageToOwner(
+                                "Aviso: item antigo será devolvido assim que houver espaço.");
+                        }
+                        else
+                        {
+                            Debug.LogError($"[NetworkInventory] PURGATÓRIO CHEIO! Item '{oldItemId}' PERDIDO.");
+                            _netPlayer?.RpcShowMessageToOwner(
+                                "<color=red>Erro: Purgatório cheio! O item antigo foi perdido!</color>");
+                        }
+                    }
+                }
+
+                return true;
+            }
+            finally
+            {
+                _isProcessingEquip = false;
+            }
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -827,6 +843,9 @@ namespace RPG.Network
         public void CmdEquipGem(int skillSlotIndex, int inventorySlotIndex)
         {
             if (connectionToClient == null) return;
+            if (Time.time - _lastEquipCmdTime < EQUIP_CMD_COOLDOWN) return;
+            _lastEquipCmdTime = Time.time;
+
             if (_netPlayer == null || _netPlayer.Dead) return;
 
             if (skillSlotIndex < 0 || skillSlotIndex >= GEM_SLOT_COUNT)
@@ -877,6 +896,9 @@ namespace RPG.Network
         public void CmdUnequipGem(int skillSlotIndex)
         {
             if (connectionToClient == null) return;
+            if (Time.time - _lastEquipCmdTime < EQUIP_CMD_COOLDOWN) return;
+            _lastEquipCmdTime = Time.time;
+
             if (_netPlayer == null || _netPlayer.Dead) return;
 
             if (skillSlotIndex < 0 || skillSlotIndex >= GEM_SLOT_COUNT)

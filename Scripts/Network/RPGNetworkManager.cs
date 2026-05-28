@@ -340,6 +340,13 @@ namespace RPG.Network
             {
                 Debug.LogWarning($"[RPGNetworkManager] Spawn expirado: {pending.CharData?.CharacterName}");
                 _pendingSpawns.Remove(conn.connectionId);
+                
+                // FIX (Bug 10): Notifica o cliente sobre o timeout do spawn
+                conn.Send(new MsgSelectCharacterResponse
+                {
+                    Success = false,
+                    Error   = "O tempo de carregamento expirou. Tente novamente."
+                });
                 return;
             }
 

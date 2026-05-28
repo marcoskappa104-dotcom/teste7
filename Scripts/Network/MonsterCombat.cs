@@ -37,6 +37,7 @@ namespace RPG.Network
         private const float DAMAGE_LOG_CLEANUP_INTERVAL    = 60f;
         private const int   MAX_DAMAGE_LOG_ENTRIES         = 64;
         private static readonly Collider[] _aoeBuffer = new Collider[32];
+        private static int _targetableLayerMask = -1;
 
         // ── Componentes ────────────────────────────────────────────────────
         private NetworkMonsterEntity _entity;
@@ -58,6 +59,9 @@ namespace RPG.Network
             _entity = GetComponent<NetworkMonsterEntity>();
             _ai     = GetComponent<MonsterAI>();
             _damageLogCleanupWait = new WaitForSeconds(DAMAGE_LOG_CLEANUP_INTERVAL);
+
+            if (_targetableLayerMask == -1)
+                _targetableLayerMask = LayerMask.GetMask("Targetable");
         }
 
         [Server]
@@ -246,8 +250,8 @@ namespace RPG.Network
             // --- AoE Support ---
             if (skill.AoERadius > 0.1f)
             {
-                // FIX: Usa OverlapSphereNonAlloc e HashSet para evitar dano duplo ou perda do alvo principal
-                int count = Physics.OverlapSphereNonAlloc(transform.position, skill.AoERadius, _aoeBuffer);
+                // FIX (Bug 7): Usa LayerMask para ignorar terreno/props e focar apenas em alvos válidos
+                int count = Physics.OverlapSphereNonAlloc(transform.position, skill.AoERadius, _aoeBuffer, _targetableLayerMask);
                 var hitEntities = new HashSet<ITargetable>();
                 
                 // Sempre garante que o alvo direto recebe o dano

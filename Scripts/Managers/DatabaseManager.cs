@@ -295,9 +295,12 @@ namespace RPG.Managers
             {
                 _writeEvent.Wait(500);
                 _writeEvent.Reset();
-                DrainQueue();
+
+                if (_writeThreadRunning)
+                    DrainQueue();
             }
-            DrainQueue();
+            // Não drenamos aqui! O FlushAndClose cuidará da drenagem final na main thread
+            // após o Join, garantindo que não haja duas threads drenando simultaneamente.
         }
 
         private void DrainQueue()

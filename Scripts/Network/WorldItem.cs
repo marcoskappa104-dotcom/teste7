@@ -311,17 +311,35 @@ namespace RPG.Network
 
             // Se coletou apenas parte (ex: inventário encheu no meio do stack),
             // a quantidade restante continua no chão.
+            // FIX (Bug 2): Para evitar race condition de dois jogadores coletarem a mesma "sobra"
+            // ao mesmo tempo (porque _picked voltaria a ser false), o item original 
+            // é destruído e um novo WorldItem é spawnado para o restante.
             if (actuallyTaken < _quantity)
             {
-                _quantity -= actuallyTaken;
-                _picked    = false; // Permite que seja coletado de novo
+                int remaining = _quantity - actuallyTaken;
+                
+                // Spawn de um novo item para o restante
+                var nm = RPGNetworkManager.singleton;
+                if (nm != null)
+                {
+                    // Encontra o prefab do item. Se não houver específico, usa o atual
+                    GameObject prefab = gameObject; // Fallback para o próprio objeto
+                    
+                    var newItemGo = Instantiate(prefab, transform.position, transform.rotation);
+                    var newItem   = newItemGo.GetComponent<WorldItem>();
+                    if (newItem != null)
+                    {
+                        // Inicializa sem o efeito de pulo (já está no destino)
+                        newItem.ServerInitialize(_itemId, transform.position, transform.position, remaining);
+                        NetworkServer.Spawn(newItemGo);
+                    }
+                }
 
-                // Feedback visual/sonoro de coleta parcial se necessário
-                // Aqui apenas atualizamos a SyncVar _quantity, o que deve refletir no visual se houver label
-                return;
+                // O item original segue o fluxo de sucesso total para o que foi coletado
+                _quantity = actuallyTaken;
             }
 
-            // ── SUCESSO TOTAL DAQUI PRA BAIXO ────────────────────────────
+            // ── SUCESSO DAQUI PRA BAIXO ────────────────────────────
 
             if (_despawnCoroutine != null)
             {

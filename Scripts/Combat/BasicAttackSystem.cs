@@ -434,6 +434,14 @@ namespace RPG.Combat
             if (IsTargetGone(_attackTarget)) return;
             if (_identity == null) return;
 
+            // FIX (Bug 3): Validação de MP no cliente para evitar spam de Cmd e animação sem efeito
+            if (_currentProfile.ManaCost > 0f && _player.CurrentMP < _currentProfile.ManaCost)
+            {
+                UIManager.Instance?.ShowMessage("<color=red>MP insuficiente!</color>");
+                CancelAutoAttackSoft();
+                return;
+            }
+
             string animTrigger = !string.IsNullOrEmpty(_currentProfile.AnimTrigger)
                 ? _currentProfile.AnimTrigger
                 : "Attack";

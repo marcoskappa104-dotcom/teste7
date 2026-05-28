@@ -55,6 +55,7 @@ namespace RPG.UI
             public string Prefix = "";
         }
         private readonly Dictionary<DamageGroupKey, DamageGroup> _damageGroups = new Dictionary<DamageGroupKey, DamageGroup>();
+        private readonly List<DamageGroupKey> _groupKeysBuffer = new List<DamageGroupKey>();
         private const float GROUP_WINDOW = 0.2f; // 200ms
 
         private void Awake()
@@ -95,8 +96,10 @@ namespace RPG.UI
             // Processa grupos de dano
             if (_damageGroups.Count > 0)
             {
-                var keys = new List<DamageGroupKey>(_damageGroups.Keys);
-                foreach (var key in keys)
+                _groupKeysBuffer.Clear();
+                foreach (var k in _damageGroups.Keys) _groupKeysBuffer.Add(k);
+
+                foreach (var key in _groupKeysBuffer)
                 {
                     var group = _damageGroups[key];
                     group.TimeRemaining -= dt;
