@@ -1,84 +1,109 @@
+using System;
+using System.Collections;
 using UnityEngine;
 using UnityEngine.AI;
-using UnityEngine.EventSystems;
 using Mirror;
 using RPG.Character;
 using RPG.UI;
-using RPG.Combat;
+using RPG.Network;
+using RPG.Data;
 
-namespace RPG.Network
+namespace RPG.Combat
 {
-
-    [RequireComponent(typeof(NavMeshAgent))]
-    public class NetworkPlayerController : NetworkBehaviour
+    /// <summary>
+    /// Sistema de skills ARPG-style (Diablo / PoE).
+    ///
+    /// MUDANÇAS vs. versão antiga:
+    ///   • SEM target-lock obrigatório. A mira vem do CURSOR no momento do uso.
+    ///   • Cast instantâneo é o padrão. CastTime > 0 só p/ skills pesadas e,
+    ///     por padrão, NÃO é cancelado por movimento (configurável na skill).
+    ///   • Comando vai para o PLAYER (CmdUseSkill), não para o monstro.
+    ///
+    /// NOVO:
+    ///   • Walk-to-skill APENAS para TargetEnemy: se o inimigo sob o cursor está
+    ///     fora de alcance, o player anda até o range e então conjura.
+    ///   • Cura (SelfCast + Heal): não dispara se o HP já está cheio (predição
+    ///     no cliente; o servidor revalida).
+    ///
+    /// Modos de mira (resolvidos aqui no cliente):
+    ///   SelfCast / AroundSelf → sem mira.
+    ///   TargetEnemy           → raycast do cursor; precisa acertar um inimigo.
+    ///   Skillshot             → direção = (ponto do cursor no chão − player).
+    ///   GroundTarget          → ponto do cursor no chão (clamped ao Range).
+    /// </summary>
+    [RequireComponent(typeof(PlayerEntity))]
+    public class SkillSystem : NetworkBehaviour
     {
-        [Header("Layers")]
-        [SerializeField] private LayerMask terrainLayer;
-        [SerializeField] private LayerMask targetableLayer;
-        [SerializeField] private LayerMask itemLayer;
-        [Tooltip("Layers que bloqueiam a câmera. Normalmente o mesmo do terrain.")]
-        [SerializeField] private LayerMask cameraOcclusionLayer;
+        public const int MAX_SKILLS = 4;
 
-        [Header("Câmera")]
-        [SerializeField] private float orbitSensitivity = 3f;
-        [SerializeField] private float zoomSensitivity  = 5f;
-        [SerializeField] private float cameraSmoothTime = 0.05f;
-        [SerializeField] private float cameraHeight     = 1.5f;
-
-        [Header("Movimento (Click & Hold)")]
-        [SerializeField] private float updateTargetInterval = 0.12f;
-        [SerializeField] private float cmdMoveInterval = 0.18f;
-        [SerializeField] private float redirectThreshold = 0.4f;
-
-        [Header("Indicador de Movimento")]
-        [SerializeField] private GameObject moveIndicatorPrefab;
+        [Header("Mira")]
+        [Tooltip("Layers que contam como 'chão' para mira de skillshot/ground target.")]
+        [SerializeField] private LayerMask groundMask;
+        [Tooltip("Layers de inimigos/alvos selecionáveis (mesma dos monstros).")]
+        [SerializeField] private LayerMask targetableMask;
 
         [Header("Debug")]
-        [SerializeField] private bool debugMovement = false;
+        [Tooltip("Loga no Console o motivo de cada skill não disparar. Deixe ligado até ajustar tudo.")]
+        [SerializeField] private bool debugLogs = true;
+
+        private const float INSTANT_CAST_EPS = 0.05f;
+        private const float RAYCAST_DIST      = 300f;
+
+        // ── Input buffer (mantém a fluidez quando se aperta durante um cast) ─
+        private const float INPUT_BUFFER_WINDOW = 0.4f;
+        private int   _bufferedSkillIndex = -1;
+        private float _bufferTimestamp    = -1f;
 
         // ── Componentes ────────────────────────────────────────────────────
-        private NavMeshAgent           _agent;
-        private PlayerEntity           _playerEntity;
-        private SkillSystem            _skillSystem;
-        private BasicAttackSystem      _basicAttack;
-        private NetworkIdentity        _identity;
-        private Camera                 _cam;
-        private RPG.NPC.NPCInteractor  _npcInteractor;
+        private PlayerEntity            _player;
+        private Animator                _animator;
+        private NetworkInventory        _inventory;
+        private RPG.Network.NetworkPlayer       _netPlayer;
+        private NavMeshAgent            _agent;
+        private NetworkPlayerController _controller;
 
-        // ── Estado de movimento / combate ──────────────────────────────────
-        private bool    _holdMoving;
-        private bool    _attackHeld;
-        private Vector3 _lastSentDestination;
-        private float   _lastTargetUpdateTime;
-        private float   _lastCmdMoveTime;
+        // ── Cooldown visual ────────────────────────────────────────────────
+        private readonly float[] _uiCooldownTimers = new float[MAX_SKILLS];
 
-        // ── Câmera ─────────────────────────────────────────────────────────
-        private float   _yaw         = 45f;
-        private float   _pitch       = 45f;
-        private float   _distance    = 12f;
-        private bool    _orbiting;
-        private Vector3 _camVelocity = Vector3.zero;
+        // ── Cast ───────────────────────────────────────────────────────────
+        private Coroutine _castCoroutine;
+        private bool      _isCasting;
 
-        private const float PITCH_MIN      = 10f;
-        private const float PITCH_MAX      = 80f;
-        private const float DIST_MIN       = 3f;
-        private const float DIST_MAX       = 30f;
-        private const float MAX_MOVE_DIST  = 120f;
-        private const float CAM_SKIN_WIDTH = 0.3f;
+        // ── Canal de beam (laser que segue o cursor) ───────────────────────
+        private bool      _beamChanneling;
+        private int       _beamSkillIndex = -1;
+        private float     _beamEndsAt;
+        private Vector3   _lastBeamDir;
+        private const float BEAM_AIM_SEND_INTERVAL = 0.05f; // ~20 Hz
+        private float     _beamSendTimer;
 
-        private const float AGENT_ACCELERATION   = 60f;
-        private const float AGENT_ANGULAR_SPEED  = 720f;
-        private const float AGENT_STOPPING_DIST  = 0.15f;
-        private const float AGENT_MIN_SPEED     = 3f;
-        private const float AGENT_MAX_SPEED     = 7f;
+        // ── Walk-to-range (somente skills TargetEnemy) ──────────────────────
+        private const float APPROACH_MOVE_INTERVAL       = 0.18f;
+        private const float APPROACH_REDIRECT_THRESHOLD  = 0.4f;
+        private const float APPROACH_DEST_FRACTION        = 0.85f;
+        private const float APPROACH_TIMEOUT             = 8f;
+        private const float SKILL_RANGE_TOLERANCE_CLIENT = 1.1f;
 
-        private float _lastSecurityWarnTime = -999f;
-        private const float SECURITY_WARN_INTERVAL = 2f;
+        private bool                 _approachActive;
+        private int                  _approachSkillIndex = -1;
+        private NetworkMonsterEntity _approachTarget;
+        private float                _approachStartedAt;
+        private float                _approachLastMoveCmd;
+        private Vector3              _approachLastChaseDest = Vector3.positiveInfinity;
 
-        // --- Anti-SpeedHack ---
-        private Vector3 _serverLastPosition;
-        private float   _serverLastMoveTime;
-        private const float SPEED_HACK_TOLERANCE = 1.6f;
+        private bool _subscribedPlayer;
+        private bool _subscribedInventory;
+
+        // ── Eventos p/ UI ──────────────────────────────────────────────────
+        public event Action<int, float>    OnCooldownStarted;
+        public event Action<int>           OnSkillFired;
+        public event Action                OnSkillBarNeedsRefresh;
+        public event Action<string, float> OnCastStarted;
+        public event Action<float>         OnCastProgress;
+        public event Action                OnCastFinished;
+
+        public bool IsCasting => _isCasting;
+        public int  SkillCount => MAX_SKILLS;
 
         // ══════════════════════════════════════════════════════════════════
         // Lifecycle
@@ -86,423 +111,670 @@ namespace RPG.Network
 
         private void Awake()
         {
-            _agent       = GetComponent<NavMeshAgent>();
-            _basicAttack = GetComponent<BasicAttackSystem>();
-            _identity    = GetComponent<NetworkIdentity>();
-        }
-
-        public override void OnStartServer()
-        {
-            _serverLastPosition = transform.position;
-            _serverLastMoveTime = Time.time;
-        }
-
-        private void OnEnable()
-        {
-            Cursor.visible   = true;
-            Cursor.lockState = CursorLockMode.None;
-        }
-
-        private void OnDisable()
-        {
-            _orbiting        = false;
-            _holdMoving      = false;
-            _attackHeld      = false;
-            Cursor.visible   = true;
-            Cursor.lockState = CursorLockMode.None;
+            _player     = GetComponent<PlayerEntity>();
+            _animator   = GetComponentInChildren<Animator>();
+            _inventory  = GetComponent<NetworkInventory>();
+            _netPlayer  = GetComponent<RPG.Network.NetworkPlayer>();
+            _agent      = GetComponent<NavMeshAgent>();
+            _controller = GetComponent<NetworkPlayerController>();
         }
 
         public override void OnStartLocalPlayer()
         {
-            _playerEntity  = GetComponent<PlayerEntity>();
-            _skillSystem   = GetComponent<SkillSystem>();
-            _basicAttack   = GetComponent<BasicAttackSystem>();
-            _npcInteractor = GetComponent<RPG.NPC.NPCInteractor>();
-            _cam           = Camera.main;
+            SubscribeInventory();
+            SubscribePlayer();
+        }
 
-            if (_cam == null)
-                Debug.LogWarning("[NetworkPlayerController] Camera.main não encontrada.");
+        public override void OnStopClient()
+        {
+            UnsubscribeInventory();
+            UnsubscribePlayer();
+            CancelCast();
+            CancelPendingApproach();
+        }
 
-            if (_agent != null)
-            {
-                _agent.acceleration     = AGENT_ACCELERATION;
-                _agent.angularSpeed     = AGENT_ANGULAR_SPEED;
-                _agent.autoBraking      = false;
-                _agent.stoppingDistance = AGENT_STOPPING_DIST;
+        private void OnDestroy()
+        {
+            UnsubscribeInventory();
+            UnsubscribePlayer();
+            CancelCast();
+            CancelPendingApproach();
+        }
 
-                if (_playerEntity != null && _playerEntity.Stats != null)
-                    _agent.speed = Mathf.Clamp(_playerEntity.Stats.MoveSpeed, AGENT_MIN_SPEED, AGENT_MAX_SPEED);
-            }
+        private void SubscribeInventory()
+        {
+            if (_subscribedInventory || _inventory == null) return;
+            _inventory.OnGemLoadoutChanged += OnGemLoadoutChanged;
+            _subscribedInventory = true;
+        }
 
-            Cursor.visible   = true;
-            Cursor.lockState = CursorLockMode.None;
+        private void UnsubscribeInventory()
+        {
+            if (!_subscribedInventory || _inventory == null) return;
+            _inventory.OnGemLoadoutChanged -= OnGemLoadoutChanged;
+            _subscribedInventory = false;
+        }
 
-            UIManager.Instance?.BindLocalPlayer(_playerEntity);
+        private void SubscribePlayer()
+        {
+            if (_subscribedPlayer || _player == null) return;
+            _player.OnDeathChanged += OnPlayerDeathChanged;
+            _subscribedPlayer = true;
+        }
+
+        private void UnsubscribePlayer()
+        {
+            if (!_subscribedPlayer || _player == null) return;
+            _player.OnDeathChanged -= OnPlayerDeathChanged;
+            _subscribedPlayer = false;
+        }
+
+        private void OnGemLoadoutChanged()
+        {
+            if (isLocalPlayer) OnSkillBarNeedsRefresh?.Invoke();
+        }
+
+        private void OnPlayerDeathChanged(bool isDead)
+        {
+            if (isDead) { CancelCast(); CancelPendingApproach(); }
         }
 
         private void Update()
         {
             if (!isLocalPlayer) return;
-            if (_cam == null) _cam = Camera.main;
 
-            HandleMouseInput();
-            HandleSkillInput();
-            HandleCameraOrbit();
-            HandleUIInput();
-        }
+            for (int i = 0; i < MAX_SKILLS; i++)
+                if (_uiCooldownTimers[i] > 0f)
+                    _uiCooldownTimers[i] -= Time.deltaTime;
 
-        private void LateUpdate()
-        {
-            if (!isLocalPlayer) return;
-            UpdateCameraPosition();
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Mouse — Diablo-style: segurar sobre inimigo = atacar; chão = mover
-        // ══════════════════════════════════════════════════════════════════
-
-        private void HandleMouseInput()
-        {
-            if (_cam == null) return;
-            bool overUI = UIInputUtils.IsPointerOverUI();
-
-            // ── Down ───────────────────────────────────────────────────────
-            if (Input.GetMouseButtonDown(0) && !overUI)
+            // Buffer de input: se apertou durante um cast, dispara logo que liberar.
+            if (_bufferedSkillIndex != -1)
             {
-                Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
-
-                if (TryPickupItem(ray))     { ResetHold(); return; }
-                if (TryHandleNpcClick(ray)) { ResetHold(); return; }
-
-                if (TryGetMonsterUnderCursor(ray, out var monster))
+                if (Time.time - _bufferTimestamp > INPUT_BUFFER_WINDOW)
                 {
-                    _attackHeld = true;
-                    _holdMoving = false;
-                    _basicAttack?.HoldAttack(monster);
-                    return;
+                    _bufferedSkillIndex = -1;
                 }
-
-                // Chão → mover
-                _basicAttack?.ReleaseAttack();
-                _attackHeld = false;
-                if (TryMoveToGround(ray, showIndicator: true))
+                else if (!_isCasting)
                 {
-                    _holdMoving           = true;
-                    _lastTargetUpdateTime = Time.time;
+                    int idx = _bufferedSkillIndex;
+                    _bufferedSkillIndex = -1;
+                    TryUseSkill(idx);
                 }
             }
 
-            // ── Held ───────────────────────────────────────────────────────
-            if (Input.GetMouseButton(0) && !overUI)
-            {
-                Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
+            if (_isCasting && _player.IsDead) CancelCast();
 
-                if (_attackHeld)
-                {
-                    // Re-mira para o inimigo sob o cursor; se sair pro chão,
-                    // mantém o alvo atual (BasicAttackSystem persegue).
-                    if (TryGetMonsterUnderCursor(ray, out var monster))
-                        _basicAttack?.HoldAttack(monster);
-                }
-                else if (_holdMoving)
-                {
-                    if (Time.time - _lastTargetUpdateTime >= updateTargetInterval)
-                    {
-                        _lastTargetUpdateTime = Time.time;
-                        TryMoveToGround(ray, showIndicator: false);
-                    }
-                }
-            }
-
-            // ── Up ─────────────────────────────────────────────────────────
-            if (Input.GetMouseButtonUp(0))
-            {
-                if (_attackHeld) _basicAttack?.ReleaseAttack();
-                _attackHeld = false;
-                _holdMoving = false;
-            }
-        }
-
-        private void ResetHold()
-        {
-            _holdMoving = false;
-            if (_attackHeld) _basicAttack?.ReleaseAttack();
-            _attackHeld = false;
-        }
-
-        private bool TryGetMonsterUnderCursor(Ray ray, out NetworkMonsterEntity monster)
-        {
-            monster = null;
-            if (targetableLayer == 0) return false;
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
-            monster = hit.collider.GetComponentInParent<NetworkMonsterEntity>();
-            return monster != null && !monster.IsDead;
-        }
-
-        private bool TryHandleNpcClick(Ray ray)
-        {
-            if (targetableLayer == 0) return false;
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
-
-            var npc = hit.collider.GetComponentInParent<RPG.NPC.NetworkNPC>();
-            if (npc == null) return false;
-
-            _basicAttack?.ReleaseAttack();
-            _npcInteractor?.TryInteract(npc);
-            return true;
-        }
-
-        private bool TryPickupItem(Ray ray)
-        {
-            if (itemLayer == 0) return false;
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, itemLayer)) return false;
-
-            var worldItem = hit.collider.GetComponentInParent<WorldItem>();
-            if (worldItem == null) return false;
-
-            if (_identity != null) worldItem.CmdPickUp(_identity.netId);
-            return true;
-        }
-
-        private bool TryMoveToGround(Ray ray, bool showIndicator)
-        {
-            int moveLayerMask = terrainLayer != 0
-                ? (int)terrainLayer
-                : ~(1 << LayerMask.NameToLayer("Targetable"));
-
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return false;
-
-            if (showIndicator)
-            {
-                _playerEntity?.ClearTarget();
-                UIManager.Instance?.ClearTargetPanel();
-            }
-
-            Vector3 dest = hit.point;
-            if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
-                dest = navHit.position;
-
-            if (Vector3.Distance(_lastSentDestination, dest) >= redirectThreshold)
-            {
-                if (_agent != null && _agent.isOnNavMesh) _agent.SetDestination(dest);
-                _lastSentDestination = dest;
-            }
-
-            if (Time.time - _lastCmdMoveTime >= cmdMoveInterval)
-            {
-                _lastCmdMoveTime = Time.time;
-                CmdMoveTo(dest);
-            }
-
-            if (showIndicator) SpawnMoveIndicator(hit.point);
-            return true;
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Teclado — skills disparam na hora, miram pelo cursor
-        // ══════════════════════════════════════════════════════════════════
-
-        private void HandleSkillInput()
-        {
-            if (_skillSystem == null) return;
-            if (_playerEntity != null && _playerEntity.IsDead) return;
-            if (UIInputUtils.IsTypingInInputField()) return;
-            if (DialogUI.Instance != null && DialogUI.Instance.IsOpen) return;
-
-            if (Input.GetKeyDown(KeyCode.Q)) _skillSystem.TryUseSkill(0);
-            if (Input.GetKeyDown(KeyCode.W)) _skillSystem.TryUseSkill(1);
-            if (Input.GetKeyDown(KeyCode.E)) _skillSystem.TryUseSkill(2);
-            if (Input.GetKeyDown(KeyCode.R)) _skillSystem.TryUseSkill(3);
-
-            // Soltar a tecla encerra um laser sustentado (beam que segue o cursor).
-            if (Input.GetKeyUp(KeyCode.Q)) _skillSystem.NotifySkillKeyReleased(0);
-            if (Input.GetKeyUp(KeyCode.W)) _skillSystem.NotifySkillKeyReleased(1);
-            if (Input.GetKeyUp(KeyCode.E)) _skillSystem.NotifySkillKeyReleased(2);
-            if (Input.GetKeyUp(KeyCode.R)) _skillSystem.NotifySkillKeyReleased(3);
-
-            if (Input.GetKeyDown(KeyCode.C)) AttributeWindowUI.Instance?.Toggle();
-        }
-
-        private void HandleUIInput()
-        {
-            if (UIInputUtils.IsTypingInInputField()) return;
-
-            if (Input.GetKeyDown(KeyCode.I)) { EnsureCursorVisible(); InventoryUI.Instance?.Toggle(); }
-            if (Input.GetKeyDown(KeyCode.P)) { EnsureCursorVisible(); PowerGemUI.Instance?.Toggle(); }
-        }
-
-        private void EnsureCursorVisible()
-        {
-            if (!_orbiting)
-            {
-                Cursor.visible   = true;
-                Cursor.lockState = CursorLockMode.None;
-            }
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Câmera (inalterada)
-        // ══════════════════════════════════════════════════════════════════
-
-        private void HandleCameraOrbit()
-        {
-            if (Input.GetMouseButtonDown(1))
-            {
-                _orbiting        = true;
-                Cursor.visible   = false;
-                Cursor.lockState = CursorLockMode.Locked;
-            }
-            if (Input.GetMouseButtonUp(1))
-            {
-                _orbiting        = false;
-                Cursor.visible   = true;
-                Cursor.lockState = CursorLockMode.None;
-            }
-
-            if (_orbiting)
-            {
-                _yaw   += Input.GetAxis("Mouse X") * orbitSensitivity;
-                _pitch -= Input.GetAxis("Mouse Y") * orbitSensitivity;
-                _pitch  = Mathf.Clamp(_pitch, PITCH_MIN, PITCH_MAX);
-                if (_yaw > 360f)  _yaw -= 360f;
-                if (_yaw < -360f) _yaw += 360f;
-            }
-
-            _distance -= Input.GetAxis("Mouse ScrollWheel") * zoomSensitivity;
-            _distance  = Mathf.Clamp(_distance, DIST_MIN, DIST_MAX);
-        }
-
-        private void UpdateCameraPosition()
-        {
-            if (_cam == null) return;
-
-            Quaternion rot   = Quaternion.Euler(_pitch, _yaw, 0f);
-            Vector3    pivot = transform.position + Vector3.up * cameraHeight;
-            Vector3    dir   = rot * new Vector3(0f, 0f, -1f);
-
-            float effectiveDistance = _distance;
-            int   occlusionMask = cameraOcclusionLayer != 0 ? (int)cameraOcclusionLayer : (int)terrainLayer;
-
-            if (occlusionMask != 0
-                && Physics.SphereCast(pivot, CAM_SKIN_WIDTH, dir, out RaycastHit camHit, _distance, occlusionMask))
-            {
-                effectiveDistance = Mathf.Max(DIST_MIN, camHit.distance - CAM_SKIN_WIDTH);
-            }
-
-            Vector3 target = pivot + dir * effectiveDistance;
-            if (target.y < transform.position.y + 0.5f) target.y = transform.position.y + 0.5f;
-
-            _cam.transform.position = Vector3.SmoothDamp(
-                _cam.transform.position, target, ref _camVelocity, cameraSmoothTime);
-            _cam.transform.LookAt(pivot);
-        }
-
-        // ══════════════════════════════════════════════════════════════════
-        // Commands (anti-cheat inalterado)
-        // ══════════════════════════════════════════════════════════════════
-
-        [Command]
-        public void CmdMoveTo(Vector3 destination)
-        {
-            if (float.IsNaN(destination.x) || float.IsInfinity(destination.x)
-                || float.IsNaN(destination.y) || float.IsInfinity(destination.y)
-                || float.IsNaN(destination.z) || float.IsInfinity(destination.z))
-            {
-                Debug.LogWarning("[Security] CmdMoveTo com coordenadas inválidas.");
-                return;
-            }
-
-            var netPlayer = GetComponent<NetworkPlayer>();
-            if (netPlayer == null || netPlayer.Dead) return;
-
-            float timePassed = Time.time - _serverLastMoveTime;
-            if (timePassed > 0.05f)
-            {
-                float actualDistMoved = Vector3.Distance(_serverLastPosition, transform.position);
-                float maxSpeed = (_playerEntity != null && _playerEntity.Stats != null)
-                    ? _playerEntity.Stats.MoveSpeed : AGENT_MAX_SPEED;
-
-                float maxAllowedDist = (maxSpeed * timePassed * SPEED_HACK_TOLERANCE) + 0.5f;
-
-                if (actualDistMoved > maxAllowedDist)
-                {
-                    if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
-                    {
-                        _lastSecurityWarnTime = Time.time;
-                        Debug.LogWarning($"[Security] Movimento suspeito: {netPlayer.CharacterName} | Real: {actualDistMoved:0.1} | Max: {maxAllowedDist:0.1} | T: {timePassed:0.00}s");
-                    }
-                    _agent.Warp(_serverLastPosition);
-                    return;
-                }
-            }
-
-            Vector3 finalDest = destination;
-            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2.0f, NavMesh.AllAreas))
-            {
-                finalDest = hit.position;
-            }
-            else
-            {
-                if (debugMovement)
-                    Debug.LogWarning($"[Server] CmdMoveTo: destino fora do NavMesh para {netPlayer.CharacterName}");
-                return;
-            }
-
-            float totalDist = Vector3.Distance(transform.position, finalDest);
-            if (totalDist > MAX_MOVE_DIST)
-            {
-                if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
-                {
-                    _lastSecurityWarnTime = Time.time;
-                    Debug.LogWarning($"[Security] CmdMoveTo muito longo: dist={totalDist:0.0} | {netPlayer.CharacterName}");
-                }
-                return;
-            }
-
-            _serverLastPosition = transform.position;
-            _serverLastMoveTime = Time.time;
-
-            if (_agent != null && _agent.isOnNavMesh)
-            {
-                _agent.SetDestination(finalDest);
-                _agent.speed = (_playerEntity != null && _playerEntity.Stats != null)
-                    ? Mathf.Clamp(_playerEntity.Stats.MoveSpeed, AGENT_MIN_SPEED, AGENT_MAX_SPEED)
-                    : AGENT_MAX_SPEED;
-            }
+            TickBeamChannel();
+            TickApproach();
         }
 
         // ══════════════════════════════════════════════════════════════════
         // API pública
         // ══════════════════════════════════════════════════════════════════
 
-        public void SetEnabled(bool value)
+        public SkillData GetSkill(int index)
         {
-            enabled = value;
-            if (!value)
-            {
-                _holdMoving = false;
-                _attackHeld = false;
-                _basicAttack?.ReleaseAttack();
-                _skillSystem?.CancelCast();
+            if (index < 0 || index >= MAX_SKILLS) return null;
+            return _inventory?.GetEquippedSkill(index);
+        }
 
-                _orbiting        = false;
-                Cursor.visible   = true;
-                Cursor.lockState = CursorLockMode.None;
+        public float GetUICooldown(int i)
+            => (i >= 0 && i < MAX_SKILLS) ? Mathf.Max(0f, _uiCooldownTimers[i]) : 0f;
+
+        public bool IsOnUICooldown(int i) => GetUICooldown(i) > 0f;
+
+        /// <summary>
+        /// Ponto de entrada chamado pelo controller ao apertar Q/W/E/R.
+        /// Resolve a mira AGORA (cursor) e dispara. Nada de selecionar antes.
+        /// </summary>
+        public void TryUseSkill(int index)
+        {
+            if (!isLocalPlayer) return;
+            if (index < 0 || index >= MAX_SKILLS) return;
+            if (_player == null) { Log("BLOQUEADO: PlayerEntity ausente."); return; }
+            if (!_player.IsInitialized) { Log("BLOQUEADO: player ainda não inicializado (IsInitialized=false)."); return; }
+            if (_player.IsDead) { Log("BLOQUEADO: player morto."); return; }
+
+            // Durante um cast, enfileira (input buffering).
+            if (_isCasting)
+            {
+                _bufferedSkillIndex = index;
+                _bufferTimestamp    = Time.time;
+                return;
+            }
+
+            var skill = GetSkill(index);
+            if (skill == null)
+            {
+                Log($"BLOQUEADO: nenhum SkillData no slot {index} (GetEquippedSkill retornou null).");
+                UIManager.Instance?.ShowMessage($"Nenhuma Joia equipada no slot {SlotName(index)}!");
+                return;
+            }
+
+            Log($"Tentando '{skill.Name}' slot {index} | AimMode={skill.AimMode} | MP={_player.CurrentMP}/{skill.ManaCost}");
+
+            // Predição cliente: MP e cooldown (servidor revalida).
+            if (_player.CurrentMP < skill.ManaCost)
+            {
+                Log("BLOQUEADO: MP insuficiente (cliente).");
+                UIManager.Instance?.ShowMessage("<color=red>MP insuficiente!</color>");
+                return;
+            }
+            if (IsOnUICooldown(index))
+            {
+                Log($"BLOQUEADO: em cooldown ({GetUICooldown(index):0.0}s).");
+                UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(index):0.0}s");
+                return;
+            }
+
+            // Novo comando cancela uma aproximação pendente anterior.
+            CancelPendingApproach();
+
+            // Cura: predição cliente — não dispara com HP cheio (servidor revalida).
+            if (skill.Type == SkillType.Heal
+                && skill.AimMode == SkillAimMode.SelfCast
+                && _player.Stats != null
+                && _player.CurrentHP >= _player.Stats.MaxHP - 0.01f)
+            {
+                Log("BLOQUEADO: HP já está cheio (cura).");
+                UIManager.Instance?.ShowMessage("Você já está com HP máximo!");
+                return;
+            }
+
+            // Walk-to-range: skill TargetEnemy com alvo fora de alcance → anda até chegar.
+            if (skill.NeedsEnemy && TryFindEnemyOutOfRange(skill, out NetworkMonsterEntity approachTarget))
+            {
+                BeginApproachAndCast(index, approachTarget);
+                return;
+            }
+
+            // Resolve a mira conforme o modo.
+            if (!ResolveAim(skill, index, out SkillCastInfo info, out string aimError))
+            {
+                Log($"BLOQUEADO: mira falhou ({aimError}).");
+                if (!string.IsNullOrEmpty(aimError))
+                    UIManager.Instance?.ShowMessage(aimError);
+                return;
+            }
+
+            StartCastAndSend(skill, info);
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // Resolução de mira (cliente)
+        // ══════════════════════════════════════════════════════════════════
+
+        private bool ResolveAim(SkillData skill, int index, out SkillCastInfo info, out string error)
+        {
+            info  = default;
+            error = null;
+
+            Camera cam = _player.MainCamera != null ? _player.MainCamera : Camera.main;
+            if (cam == null && skill.AimMode != SkillAimMode.SelfCast
+                            && skill.AimMode != SkillAimMode.AroundSelf)
+            {
+                error = "Câmera indisponível.";
+                return false;
+            }
+
+            switch (skill.AimMode)
+            {
+                case SkillAimMode.SelfCast:
+                case SkillAimMode.AroundSelf:
+                    info = SkillCastInfo.Self(index);
+                    return true;
+
+                case SkillAimMode.TargetEnemy:
+                {
+                    if (!TryRaycastEnemy(cam, out NetworkMonsterEntity monster))
+                    {
+                        error = "Mire em um inimigo.";
+                        return false;
+                    }
+                    float dist = Vector3.Distance(transform.position, monster.Position);
+                    if (dist > skill.Range * 1.1f)
+                    {
+                        error = "Alvo fora de alcance.";
+                        return false;
+                    }
+                    info = SkillCastInfo.ForTarget(index, monster.netId);
+                    FaceTowards(monster.Position);
+                    return true;
+                }
+
+                case SkillAimMode.Skillshot:
+                {
+                    if (!TryRaycastGround(cam, out Vector3 point))
+                    {
+                        error = "Mira inválida.";
+                        return false;
+                    }
+                    Vector3 origin = transform.position + Vector3.up * 1.2f;
+                    Vector3 dir = point - transform.position;
+                    dir.y = 0f;
+                    if (dir.sqrMagnitude < 0.01f) dir = transform.forward;
+                    dir.Normalize();
+                    info = SkillCastInfo.ForDirection(index, origin, dir);
+                    FaceTowards(transform.position + dir);
+                    return true;
+                }
+
+                case SkillAimMode.GroundTarget:
+                {
+                    if (!TryRaycastGround(cam, out Vector3 point))
+                    {
+                        error = "Mire em um ponto no chão.";
+                        return false;
+                    }
+                    // Clampa o ponto ao alcance máximo (servidor revalida).
+                    Vector3 flat = point - transform.position; flat.y = 0f;
+                    if (flat.magnitude > skill.Range)
+                        point = transform.position + flat.normalized * skill.Range + Vector3.up * point.y;
+                    info = SkillCastInfo.ForGround(index, point);
+                    FaceTowards(point);
+                    return true;
+                }
+            }
+
+            error = "Modo de mira desconhecido.";
+            return false;
+        }
+
+        private bool TryRaycastEnemy(Camera cam, out NetworkMonsterEntity monster)
+        {
+            monster = null;
+            if (cam == null) return false;
+            Ray ray = cam.ScreenPointToRay(Input.mousePosition);
+
+            // Se a máscara não foi atribuída no Inspector (== 0), cai para "todas as
+            // layers" para ainda funcionar; mesmo assim só aceita NetworkMonsterEntity.
+            int mask = targetableMask != 0 ? (int)targetableMask : ~0;
+
+            if (Physics.Raycast(ray, out RaycastHit hit, RAYCAST_DIST, mask, QueryTriggerInteraction.Collide))
+            {
+                monster = hit.collider.GetComponentInParent<NetworkMonsterEntity>();
+                if (monster != null && !monster.IsDead) return true;
+            }
+
+            // Fallback final: varre tudo e pega o primeiro monstro sob o cursor.
+            if (targetableMask != 0 &&
+                Physics.Raycast(ray, out RaycastHit hit2, RAYCAST_DIST, ~0, QueryTriggerInteraction.Collide))
+            {
+                monster = hit2.collider.GetComponentInParent<NetworkMonsterEntity>();
+                if (monster != null && !monster.IsDead) return true;
+            }
+
+            monster = null;
+            return false;
+        }
+
+        private bool TryRaycastGround(Camera cam, out Vector3 point)
+        {
+            point = Vector3.zero;
+            if (cam == null) return false;
+            Ray ray = cam.ScreenPointToRay(Input.mousePosition);
+
+            int mask = groundMask != 0 ? (int)groundMask : ~0;
+            if (Physics.Raycast(ray, out RaycastHit hit, RAYCAST_DIST, mask))
+            {
+                point = hit.point;
+                return true;
+            }
+            // Fallback: intercepta o plano horizontal na altura do player.
+            Plane plane = new Plane(Vector3.up, new Vector3(0f, transform.position.y, 0f));
+            if (plane.Raycast(ray, out float enter))
+            {
+                point = ray.GetPoint(enter);
+                return true;
+            }
+            return false;
+        }
+
+        private void FaceTowards(Vector3 worldPos)
+        {
+            Vector3 dir = worldPos - transform.position;
+            dir.y = 0f;
+            if (dir.sqrMagnitude > 0.01f)
+                transform.rotation = Quaternion.LookRotation(dir);
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        // Walk-to-skill (TargetEnemy fora de alcance)
+        // ══════════════════════════════════════════════════════════════════
+
+        // Retorna true SÓ se há um inimigo sob o cursor E ele está fora de alcance.
+        private bool TryFindEnemyOutOfRange(SkillData skill, out NetworkMonsterEntity monster)
+        {
+            monster = null;
+            Camera cam = _player.MainCamera != null ? _player.MainCamera : Camera.main;
+            if (cam == null) return false;
+            if (!TryRaycastEnemy(cam, out monster)) { monster = null; return false; }
+
+            float dist = Vector3.Distance(transform.position, monster.Position);
+            if (dist <= skill.Range * SKILL_RANGE_TOLERANCE_CLIENT)
+            {
+                monster = null;   // já está no alcance → ResolveAim conjura agora
+                return false;
+            }
+            return true;          // fora de alcance → precisa andar
+        }
+
+        private void BeginApproachAndCast(int index, NetworkMonsterEntity monster)
+        {
+            _approachActive        = true;
+            _approachSkillIndex    = index;
+            _approachTarget        = monster;
+            _approachStartedAt     = Time.time;
+            _approachLastMoveCmd   = 0f;
+            _approachLastChaseDest = Vector3.positiveInfinity;
+
+            _player.SetTarget(monster);
+            UIManager.Instance?.UpdateTargetPanel(monster);
+            Log($"Walk-to-skill: indo até o alcance para usar slot {index}.");
+        }
+
+        private void TickApproach()
+        {
+            if (!_approachActive) return;
+            if (_isCasting) return;
+
+            if (_player == null || _player.IsDead) { CancelApproach(); return; }
+
+            if (IsMonsterGone(_approachTarget))
+            {
+                CancelApproach();
+                _player.ClearTarget();
+                UIManager.Instance?.ClearTargetPanel();
+                return;
+            }
+
+            var skill = GetSkill(_approachSkillIndex);
+            if (skill == null || !skill.NeedsEnemy) { CancelApproach(); return; }
+
+            if (Time.time - _approachStartedAt > APPROACH_TIMEOUT)
+            {
+                StopApproachMovement();
+                CancelApproach();
+                UIManager.Instance?.ShowMessage("Não foi possível alcançar o alvo.");
+                return;
+            }
+
+            float dist  = Vector3.Distance(transform.position, _approachTarget.Position);
+            float range = skill.Range;
+
+            if (dist <= range)
+            {
+                var monster = _approachTarget;
+                int idx     = _approachSkillIndex;
+
+                StopApproachMovement();
+                CancelApproach();
+
+                if (IsOnUICooldown(idx))
+                {
+                    UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(idx):0.0}s");
+                    return;
+                }
+                if (_player.CurrentMP < skill.ManaCost)
+                {
+                    UIManager.Instance?.ShowMessage("<color=red>MP insuficiente!</color>");
+                    return;
+                }
+
+                var info = SkillCastInfo.ForTarget(idx, monster.netId);
+                FaceTowards(monster.Position);
+                StartCastAndSend(skill, info);
+                return;
+            }
+
+            ChaseForSkill(_approachTarget.Position, range);
+        }
+
+        private void ChaseForSkill(Vector3 targetPos, float range)
+        {
+            if (_agent == null || !_agent.isOnNavMesh) return;
+
+            Vector3 dest = CalculateApproachDestination(targetPos, range);
+
+            if (Vector3.Distance(dest, _approachLastChaseDest) >= APPROACH_REDIRECT_THRESHOLD)
+            {
+                _agent.stoppingDistance = 0.15f;
+                _agent.SetDestination(dest);
+                _approachLastChaseDest = dest;
+            }
+
+            if (Time.time - _approachLastMoveCmd >= APPROACH_MOVE_INTERVAL)
+            {
+                _approachLastMoveCmd = Time.time;
+                _controller?.CmdMoveTo(dest);
             }
         }
 
-        public void ServerSyncSafetyPosition(Vector3 pos)
+        private Vector3 CalculateApproachDestination(Vector3 targetPos, float range)
         {
-            _serverLastPosition = pos;
-            _serverLastMoveTime = Time.time;
+            Vector3 toTarget = targetPos - transform.position;
+            float   dist     = toTarget.magnitude;
+            float   safe     = range * APPROACH_DEST_FRACTION;
+
+            if (dist <= safe * 0.95f) return transform.position;
+
+            Vector3 destination = targetPos - toTarget.normalized * safe;
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+                return hit.position;
+            return destination;
         }
 
-        private void SpawnMoveIndicator(Vector3 pos)
+        private void StopApproachMovement()
         {
-            if (moveIndicatorPrefab == null) return;
-            var go = Instantiate(moveIndicatorPrefab,
-                pos + Vector3.up * 0.02f, Quaternion.Euler(90f, 0f, 0f));
-            Destroy(go, 0.8f);
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.ResetPath();
+                _agent.stoppingDistance = 0.5f;
+            }
+            _approachLastChaseDest = Vector3.positiveInfinity;
+        }
+
+        private void CancelApproach()
+        {
+            if (!_approachActive) return;
+            _approachActive     = false;
+            _approachSkillIndex = -1;
+            _approachTarget     = null;
+        }
+
+        /// <summary>Chamado quando o jogador inicia movimento/ataque manual.</summary>
+        public void CancelPendingApproach()
+        {
+            if (!_approachActive) return;
+            StopApproachMovement();
+            CancelApproach();
+        }
+
+        private static bool IsMonsterGone(NetworkMonsterEntity m) => m == null || m.IsDead;
+
+        // ══════════════════════════════════════════════════════════════════
+        // Cast → envio
+        // ══════════════════════════════════════════════════════════════════
+
+        private void StartCastAndSend(SkillData skill, SkillCastInfo info)
+        {
+            float castTime = 0f;
+            if (skill.CastTime > 0f && _player.Stats != null)
+                castTime = StatsCalculator.CalculateEffectiveCastTime(skill.CastTime, _player.Stats.CastSpeed);
+
+            if (castTime <= INSTANT_CAST_EPS)
+            {
+                Send(skill, info);
+                return;
+            }
+
+            if (_castCoroutine != null) StopCoroutine(_castCoroutine);
+            _castCoroutine = StartCoroutine(CastRoutine(skill, info, castTime));
+        }
+
+        private IEnumerator CastRoutine(SkillData skill, SkillCastInfo info, float castTime)
+        {
+            _isCasting = true;
+            OnCastStarted?.Invoke(skill.Name, castTime);
+
+            if (!string.IsNullOrEmpty(skill.AnimTrigger))
+                _animator?.SetTrigger("CastStart");
+
+            float elapsed = 0f;
+            bool  cancelled = false;
+            Vector3 startPos = transform.position;
+
+            while (elapsed < castTime)
+            {
+                elapsed += Time.deltaTime;
+
+                if (_player.IsDead) { cancelled = true; break; }
+
+                if (skill.MovementInterruptsCast
+                    && (transform.position - startPos).sqrMagnitude > 0.04f)
+                {
+                    cancelled = true;
+                    break;
+                }
+
+                OnCastProgress?.Invoke(elapsed / castTime);
+                yield return null;
+            }
+
+            _isCasting     = false;
+            _castCoroutine = null;
+            OnCastFinished?.Invoke();
+
+            if (!cancelled) Send(skill, info);
+        }
+
+        private void Send(SkillData skill, SkillCastInfo info)
+        {
+            if (!info.IsFinite())
+            {
+                Log("Mira não-finita — abortado.");
+                return;
+            }
+
+            if (_animator != null && !string.IsNullOrEmpty(skill.AnimTrigger))
+                CmdPlayAnim(skill.AnimTrigger);
+
+            _netPlayer?.CmdUseSkill(info);
+            Log($"CmdUseSkill {info.SkillIndex} ({skill.AimMode})");
+
+            // Se for um laser sustentado, inicia o canal que segue o cursor enquanto segura.
+            if (skill.IsSustainedBeam)
+                BeginBeamChannel(info.SkillIndex, skill, info.AimDirection);
+        }
+
+        // ── Canal de beam: segue o cursor enquanto a tecla está segurada ────
+        private void BeginBeamChannel(int index, SkillData skill, Vector3 initialDir)
+        {
+            _beamChanneling = true;
+            _beamSkillIndex = index;
+            _beamEndsAt     = Time.time + skill.BeamDuration;
+            _lastBeamDir    = initialDir;
+            _beamSendTimer  = 0f;
+        }
+
+        /// <summary>O controller chama isto quando a tecla da skill de beam é solta.</summary>
+        public void NotifySkillKeyReleased(int index)
+        {
+            if (_beamChanneling && _beamSkillIndex == index)
+                EndBeamChannel();
+        }
+
+        private void EndBeamChannel()
+        {
+            if (!_beamChanneling) return;
+            _beamChanneling = false;
+            _beamSkillIndex = -1;
+            _netPlayer?.CmdEndBeam();
+        }
+
+        private void TickBeamChannel()
+        {
+            if (!_beamChanneling) return;
+
+            // Encerra ao fim da duração (o servidor também encerra sozinho).
+            if (Time.time >= _beamEndsAt || _player == null || _player.IsDead)
+            {
+                EndBeamChannel();
+                return;
+            }
+
+            _beamSendTimer -= Time.deltaTime;
+            if (_beamSendTimer > 0f) return;
+            _beamSendTimer = BEAM_AIM_SEND_INTERVAL;
+
+            // Recalcula a direção pelo cursor e envia ao servidor (com throttle).
+            Camera cam = _player.MainCamera != null ? _player.MainCamera : Camera.main;
+            if (cam == null) return;
+            if (!TryRaycastGround(cam, out Vector3 point)) return;
+
+            Vector3 dir = point - transform.position;
+            dir.y = 0f;
+            if (dir.sqrMagnitude < 0.01f) return;
+            dir.Normalize();
+
+            // Evita spam se a direção mal mudou.
+            if (Vector3.Dot(dir, _lastBeamDir) > 0.9995f) return;
+            _lastBeamDir = dir;
+
+            FaceTowards(transform.position + dir);
+            _netPlayer?.CmdUpdateBeamAim(dir);
+        }
+
+        public void CancelCast()
+        {
+            if (_castCoroutine != null)
+            {
+                StopCoroutine(_castCoroutine);
+                _castCoroutine = null;
+            }
+            if (_isCasting)
+            {
+                _isCasting = false;
+                OnCastFinished?.Invoke();
+            }
+        }
+
+        // Confirmação / rejeição vindas do servidor (mantém compatibilidade c/ RPCs)
+        public void OnServerSkillConfirmed(int skillIndex, float cooldownDuration)
+        {
+            if (skillIndex < 0 || skillIndex >= MAX_SKILLS) return;
+            _uiCooldownTimers[skillIndex] = cooldownDuration;
+            OnCooldownStarted?.Invoke(skillIndex, cooldownDuration);
+            OnSkillFired?.Invoke(skillIndex);
+        }
+
+        public void OnServerSkillRejected(int skillIndex, string reason)
+        {
+            UIManager.Instance?.ShowMessage(reason);
+            Log($"Skill {skillIndex} rejeitada: {reason}");
+        }
+
+        // ── Animação ───────────────────────────────────────────────────────
+
+        [Command]
+        private void CmdPlayAnim(string trigger) => RpcPlayAnim(trigger);
+
+        [ClientRpc]
+        private void RpcPlayAnim(string trigger)
+        {
+            if (_animator != null && !string.IsNullOrEmpty(trigger))
+                _animator.SetTrigger(trigger);
+        }
+
+        // ── Helpers ──────────────────────────────────────────────────────
+
+        private static string SlotName(int i) => i switch
+        { 0 => "Q", 1 => "W", 2 => "E", 3 => "R", _ => i.ToString() };
+
+        private void Log(string msg)
+        {
+            if (!debugLogs) return;
+            Debug.Log($"[SkillSystem] {msg}");
         }
     }
 }
