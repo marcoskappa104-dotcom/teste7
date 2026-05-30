@@ -86,6 +86,16 @@ namespace RPG.Network
                 return;
             }
 
+            // 0) Cura: não desperdiça cooldown/MP se o HP já está cheio.
+            //    Checado ANTES de cooldown/mana. Autoritativo no servidor.
+            if (skill.Type == SkillType.Heal
+                && skill.AimMode == SkillAimMode.SelfCast
+                && CurrentHP >= MaxHP - 0.01f)
+            {
+                RpcSkillRejected(index, "Você já está com HP máximo!");
+                return;
+            }
+
             // 1) Cooldown (autoritativo)
             if (!ServerCheckAndSetCooldown(index, skill.Cooldown))
             {
@@ -136,6 +146,11 @@ namespace RPG.Network
         {
             if (skill.Type == SkillType.Heal)
             {
+                // Segurança extra: se por algum motivo chegou aqui com HP cheio,
+                // rejeita sem efeito (já é barrado no topo de CmdUseSkill).
+                if (CurrentHP >= MaxHP - 0.01f)
+                    return false;
+
                 float heal = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
                 ServerApplyHeal(heal);
             }
