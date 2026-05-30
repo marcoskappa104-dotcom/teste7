@@ -364,8 +364,9 @@ namespace RPG.Network
             }
             else
             {
-                // Impacto procedural: anel + flash curto.
-                RPG.Feedback.SkillFx.GroundImpact(pos, Mathf.Max(0.6f, _aoeRadius));
+                // Impacto procedural padrão (unificado no ProceduralFx).
+                RPG.Feedback.ProceduralFx.Play(
+                    RPG.Feedback.ProceduralPresets.Impact, pos, Vector3.forward, Mathf.Max(0.6f, _aoeRadius));
             }
         }
 
@@ -373,8 +374,8 @@ namespace RPG.Network
         private void RpcOnFizzle(Vector3 pos)
         {
             if (Application.isBatchMode) return;
-            // Dissipação suave no fim do alcance (sem dano): aro pequeno que some.
-            RPG.Feedback.SkillFx.GroundImpact(pos, 0.4f);
+            // Dissipação suave no fim do alcance (sem dano).
+            RPG.Feedback.ProceduralFx.Play(RPG.Feedback.ProceduralPresets.Fizzle, pos);
         }
     }
 }

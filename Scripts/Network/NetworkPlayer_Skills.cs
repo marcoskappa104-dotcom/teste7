@@ -28,7 +28,7 @@ namespace RPG.Network
         [Tooltip("Biblioteca id→efeito. O CastVfxId de cada skill é resolvido aqui.")]
         [SerializeField] private RPG.Feedback.VfxLibrary _vfxLibrary;
 
-        [Header("Efeitos padrão por modo (fallback; vazio = SkillFx simples)")]
+        [Header("Efeitos padrão por modo (fallback; vazio = preset procedural embutido)")]
         [SerializeField] private RPG.Feedback.ProceduralEffect _skillshotFx;
         [SerializeField] private RPG.Feedback.ProceduralEffect _groundTelegraphFx;
         [SerializeField] private RPG.Feedback.ProceduralEffect _groundImpactFx;
@@ -504,9 +504,8 @@ namespace RPG.Network
         private void RpcSkillshotVisual(Vector3 origin, Vector3 dir, float range, string vfxId)
         {
             if (Application.isBatchMode) return;
-            var fx = ResolveVfx(vfxId, _skillshotFx);
-            if (fx != null) RPG.Feedback.ProceduralFx.Play(fx, origin, dir);
-            else            SkillFx.SkillshotTrail(origin, dir, range);
+            var fx = ResolveVfx(vfxId, _skillshotFx) ?? RPG.Feedback.ProceduralPresets.Skillshot;
+            RPG.Feedback.ProceduralFx.Play(fx, origin, dir, range);
         }
 
         [ClientRpc]
@@ -514,9 +513,8 @@ namespace RPG.Network
         {
             // Usado apenas pelo beam de PULSO (duration 0). O sustentado usa Begin/Update/End.
             if (Application.isBatchMode) return;
-            var fx = ResolveVfx(vfxId, _skillshotFx);
-            if (fx != null) RPG.Feedback.ProceduralFx.Play(fx, origin, dir, range);
-            else            SkillFx.SkillshotTrail(origin, dir, range);
+            var fx = ResolveVfx(vfxId, _skillshotFx) ?? RPG.Feedback.ProceduralPresets.Skillshot;
+            RPG.Feedback.ProceduralFx.Play(fx, origin, dir, range);
             var mgr = CombatFeedbackManager.Instance;
             if (mgr != null) mgr.Shake(0.10f);
         }
@@ -553,17 +551,16 @@ namespace RPG.Network
         {
             if (Application.isBatchMode) return;
             // O telegraph usa o efeito dedicado de aviso (não o id da skill, que é o impacto).
-            if (_groundTelegraphFx != null) RPG.Feedback.ProceduralFx.Play(_groundTelegraphFx, point, Vector3.forward, radius);
-            else                            SkillFx.GroundTelegraph(point, radius, delay);
+            var fx = _groundTelegraphFx ?? RPG.Feedback.ProceduralPresets.Telegraph;
+            RPG.Feedback.ProceduralFx.Play(fx, point, Vector3.forward, radius);
         }
 
         [ClientRpc]
         private void RpcGroundImpact(Vector3 point, float radius, string vfxId)
         {
             if (Application.isBatchMode) return;
-            var fx = ResolveVfx(vfxId, _groundImpactFx);
-            if (fx != null) RPG.Feedback.ProceduralFx.Play(fx, point, Vector3.forward, radius);
-            else            SkillFx.GroundImpact(point, radius);
+            var fx = ResolveVfx(vfxId, _groundImpactFx) ?? RPG.Feedback.ProceduralPresets.Impact;
+            RPG.Feedback.ProceduralFx.Play(fx, point, Vector3.forward, radius);
 
             // Tremor proporcional ao tamanho da área; só sacode se a câmera estiver perto.
             var cam = Camera.main;
@@ -581,9 +578,8 @@ namespace RPG.Network
         private void RpcSelfVisual(Vector3 point, float radius, string vfxId)
         {
             if (Application.isBatchMode) return;
-            var fx = ResolveVfx(vfxId, null);
-            if (fx != null) RPG.Feedback.ProceduralFx.Play(fx, point, Vector3.forward, Mathf.Max(1f, radius));
-            else            SkillFx.GroundImpact(point, Mathf.Max(1f, radius));
+            var fx = ResolveVfx(vfxId, null) ?? RPG.Feedback.ProceduralPresets.SelfCast;
+            RPG.Feedback.ProceduralFx.Play(fx, point, Vector3.forward, Mathf.Max(1f, radius));
         }
     }
 }
