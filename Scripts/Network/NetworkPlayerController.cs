@@ -45,8 +45,9 @@ namespace RPG.Network
         private Camera                 _cam;
         private RPG.NPC.NPCInteractor  _npcInteractor;
 
-        // ── Estado de movimento ────────────────────────────────────────────
+        // ── Estado de movimento / combate ──────────────────────────────────
         private bool    _holdMoving;
+        private bool    _attackHeld;
         private Vector3 _lastSentDestination;
         private float   _lastTargetUpdateTime;
         private float   _lastCmdMoveTime;
@@ -77,7 +78,7 @@ namespace RPG.Network
         // --- Anti-SpeedHack ---
         private Vector3 _serverLastPosition;
         private float   _serverLastMoveTime;
-        private const float SPEED_HACK_TOLERANCE = 1.6f;  // Aumentado para 60% de margem (mais seguro contra jitter)
+        private const float SPEED_HACK_TOLERANCE = 1.6f;
 
         // ══════════════════════════════════════════════════════════════════
         // Lifecycle
@@ -92,7 +93,6 @@ namespace RPG.Network
 
         public override void OnStartServer()
         {
-            // Inicializa a posição de segurança no servidor com a posição atual de spawn
             _serverLastPosition = transform.position;
             _serverLastMoveTime = Time.time;
         }
@@ -107,6 +107,7 @@ namespace RPG.Network
         {
             _orbiting        = false;
             _holdMoving      = false;
+            _attackHeld      = false;
             Cursor.visible   = true;
             Cursor.lockState = CursorLockMode.None;
         }
@@ -122,10 +123,6 @@ namespace RPG.Network
             if (_cam == null)
                 Debug.LogWarning("[NetworkPlayerController] Camera.main não encontrada.");
 
-            if (_npcInteractor == null)
-                Debug.LogWarning("[NetworkPlayerController] NPCInteractor não encontrado no playerPrefab. " +
-                                 "Conversas com NPCs não funcionarão.");
-
             if (_agent != null)
             {
                 _agent.acceleration     = AGENT_ACCELERATION;
@@ -140,16 +137,12 @@ namespace RPG.Network
             Cursor.visible   = true;
             Cursor.lockState = CursorLockMode.None;
 
-            if (terrainLayer    == 0) Debug.LogWarning("[NetworkPlayerController] terrainLayer não configurado.");
-            if (targetableLayer == 0) Debug.LogWarning("[NetworkPlayerController] targetableLayer não configurado.");
-
             UIManager.Instance?.BindLocalPlayer(_playerEntity);
         }
 
         private void Update()
         {
             if (!isLocalPlayer) return;
-
             if (_cam == null) _cam = Camera.main;
 
             HandleMouseInput();
@@ -165,25 +158,33 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Mouse — click & hold estilo Ragnarok/PoE
+        // Mouse — Diablo-style: segurar sobre inimigo = atacar; chão = mover
         // ══════════════════════════════════════════════════════════════════
 
         private void HandleMouseInput()
         {
             if (_cam == null) return;
-
             bool overUI = UIInputUtils.IsPointerOverUI();
 
-            // ── Click inicial (down) ───────────────────────────────────────
+            // ── Down ───────────────────────────────────────────────────────
             if (Input.GetMouseButtonDown(0) && !overUI)
             {
                 Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
 
-                if (TryPickupItem(ray))         { _holdMoving = false; return; }
-                if (TryHandleNpcClick(ray))     { _holdMoving = false; return; }
-                if (TryHandleMonsterClick(ray)) { _holdMoving = false; return; }
-                if (TrySelectTargetable(ray))   { _holdMoving = false; return; }
+                if (TryPickupItem(ray))     { ResetHold(); return; }
+                if (TryHandleNpcClick(ray)) { ResetHold(); return; }
 
+                if (TryGetMonsterUnderCursor(ray, out var monster))
+                {
+                    _attackHeld = true;
+                    _holdMoving = false;
+                    _basicAttack?.HoldAttack(monster);
+                    return;
+                }
+
+                // Chão → mover
+                _basicAttack?.ReleaseAttack();
+                _attackHeld = false;
                 if (TryMoveToGround(ray, showIndicator: true))
                 {
                     _holdMoving           = true;
@@ -191,26 +192,53 @@ namespace RPG.Network
                 }
             }
 
-            // ── Hold (botão pressionado) ───────────────────────────────────
-            if (_holdMoving && Input.GetMouseButton(0) && !overUI)
+            // ── Held ───────────────────────────────────────────────────────
+            if (Input.GetMouseButton(0) && !overUI)
             {
-                if (Time.time - _lastTargetUpdateTime >= updateTargetInterval)
+                Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
+
+                if (_attackHeld)
                 {
-                    _lastTargetUpdateTime = Time.time;
-                    Ray ray = _cam.ScreenPointToRay(Input.mousePosition);
-                    TryMoveToGround(ray, showIndicator: false);
+                    // Re-mira para o inimigo sob o cursor; se sair pro chão,
+                    // mantém o alvo atual (BasicAttackSystem persegue).
+                    if (TryGetMonsterUnderCursor(ray, out var monster))
+                        _basicAttack?.HoldAttack(monster);
+                }
+                else if (_holdMoving)
+                {
+                    if (Time.time - _lastTargetUpdateTime >= updateTargetInterval)
+                    {
+                        _lastTargetUpdateTime = Time.time;
+                        TryMoveToGround(ray, showIndicator: false);
+                    }
                 }
             }
 
+            // ── Up ─────────────────────────────────────────────────────────
             if (Input.GetMouseButtonUp(0))
+            {
+                if (_attackHeld) _basicAttack?.ReleaseAttack();
+                _attackHeld = false;
                 _holdMoving = false;
+            }
         }
 
-        /// <summary>
-        /// Detecta clique em NPC. NPCs estão no layer Targetable (mesmo dos monstros),
-        /// então este check vem ANTES de TryHandleMonsterClick para não disparar
-        /// auto-ataque acidentalmente.
-        /// </summary>
+        private void ResetHold()
+        {
+            _holdMoving = false;
+            if (_attackHeld) _basicAttack?.ReleaseAttack();
+            _attackHeld = false;
+        }
+
+        private bool TryGetMonsterUnderCursor(Ray ray, out NetworkMonsterEntity monster)
+        {
+            monster = null;
+            if (targetableLayer == 0) return false;
+            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
+            monster = hit.collider.GetComponentInParent<NetworkMonsterEntity>();
+            return monster != null && !monster.IsDead;
+        }
+
         private bool TryHandleNpcClick(Ray ray)
         {
             if (targetableLayer == 0) return false;
@@ -219,35 +247,8 @@ namespace RPG.Network
             var npc = hit.collider.GetComponentInParent<RPG.NPC.NetworkNPC>();
             if (npc == null) return false;
 
-            // Cancela ações de combate antes de tentar conversar
-            _basicAttack?.CancelAutoAttack();
-            _skillSystem?.CancelPendingWalk();
-
-            // Mesmo se fora de range, "consumimos" o clique (não vira move).
-            // O TryInteract mostra mensagem ao jogador se estiver longe.
+            _basicAttack?.ReleaseAttack();
             _npcInteractor?.TryInteract(npc);
-            return true;
-        }
-
-        private bool TryHandleMonsterClick(Ray ray)
-        {
-            if (targetableLayer == 0) return false;
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
-
-            var monster = hit.collider.GetComponentInParent<NetworkMonsterEntity>();
-            if (monster == null || monster.IsDead) return false;
-
-            bool targetChanged = _playerEntity != null
-                              && _playerEntity.CurrentTarget != (ITargetable)monster;
-
-            if (targetChanged && _basicAttack != null && _basicAttack.IsAutoAttacking)
-                _basicAttack.CancelAutoAttack();
-
-            _skillSystem?.CancelPendingWalk();
-            _playerEntity?.SetTarget(monster);
-            UIManager.Instance?.UpdateTargetPanel(monster);
-            _basicAttack?.TryRegisterClick(monster);
-
             return true;
         }
 
@@ -259,23 +260,7 @@ namespace RPG.Network
             var worldItem = hit.collider.GetComponentInParent<WorldItem>();
             if (worldItem == null) return false;
 
-            if (_identity != null)
-                worldItem.CmdPickUp(_identity.netId);
-            return true;
-        }
-
-        private bool TrySelectTargetable(Ray ray)
-        {
-            if (targetableLayer == 0) return false;
-            if (!Physics.Raycast(ray, out RaycastHit hit, 300f, targetableLayer)) return false;
-
-            var targetable = hit.collider.GetComponentInParent<ITargetable>();
-            if (targetable == null || targetable.IsDead) return false;
-
-            _skillSystem?.CancelPendingWalk();
-            _basicAttack?.CancelAutoAttack();
-            _playerEntity?.SetTarget(targetable);
-            UIManager.Instance?.UpdateTargetPanel(targetable);
+            if (_identity != null) worldItem.CmdPickUp(_identity.netId);
             return true;
         }
 
@@ -287,9 +272,6 @@ namespace RPG.Network
 
             if (!Physics.Raycast(ray, out RaycastHit hit, 300f, moveLayerMask)) return false;
 
-            _skillSystem?.CancelPendingWalkSoft();
-            _basicAttack?.CancelAutoAttackSoft();
-
             if (showIndicator)
             {
                 _playerEntity?.ClearTarget();
@@ -300,14 +282,9 @@ namespace RPG.Network
             if (NavMesh.SamplePosition(dest, out NavMeshHit navHit, 3f, NavMesh.AllAreas))
                 dest = navHit.position;
 
-            float deltaToCurrent = Vector3.Distance(_lastSentDestination, dest);
-            bool shouldRedirect  = deltaToCurrent >= redirectThreshold;
-
-            if (shouldRedirect)
+            if (Vector3.Distance(_lastSentDestination, dest) >= redirectThreshold)
             {
-                if (_agent != null && _agent.isOnNavMesh)
-                    _agent.SetDestination(dest);
-
+                if (_agent != null && _agent.isOnNavMesh) _agent.SetDestination(dest);
                 _lastSentDestination = dest;
             }
 
@@ -322,7 +299,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Teclado
+        // Teclado — skills disparam na hora, miram pelo cursor
         // ══════════════════════════════════════════════════════════════════
 
         private void HandleSkillInput()
@@ -330,15 +307,19 @@ namespace RPG.Network
             if (_skillSystem == null) return;
             if (_playerEntity != null && _playerEntity.IsDead) return;
             if (UIInputUtils.IsTypingInInputField()) return;
-
-            // Bloqueia hotkeys de skill enquanto janela de diálogo está aberta.
-            // Evita ataque acidental quando o jogador acabou de conversar.
             if (DialogUI.Instance != null && DialogUI.Instance.IsOpen) return;
 
-            if (Input.GetKeyDown(KeyCode.Q)) { _holdMoving = false; _skillSystem.TryUseSkill(0); }
-            if (Input.GetKeyDown(KeyCode.W)) { _holdMoving = false; _skillSystem.TryUseSkill(1); }
-            if (Input.GetKeyDown(KeyCode.E)) { _holdMoving = false; _skillSystem.TryUseSkill(2); }
-            if (Input.GetKeyDown(KeyCode.R)) { _holdMoving = false; _skillSystem.TryUseSkill(3); }
+            if (Input.GetKeyDown(KeyCode.Q)) _skillSystem.TryUseSkill(0);
+            if (Input.GetKeyDown(KeyCode.W)) _skillSystem.TryUseSkill(1);
+            if (Input.GetKeyDown(KeyCode.E)) _skillSystem.TryUseSkill(2);
+            if (Input.GetKeyDown(KeyCode.R)) _skillSystem.TryUseSkill(3);
+
+            // Soltar a tecla encerra um laser sustentado (beam que segue o cursor).
+            if (Input.GetKeyUp(KeyCode.Q)) _skillSystem.NotifySkillKeyReleased(0);
+            if (Input.GetKeyUp(KeyCode.W)) _skillSystem.NotifySkillKeyReleased(1);
+            if (Input.GetKeyUp(KeyCode.E)) _skillSystem.NotifySkillKeyReleased(2);
+            if (Input.GetKeyUp(KeyCode.R)) _skillSystem.NotifySkillKeyReleased(3);
+
             if (Input.GetKeyDown(KeyCode.C)) AttributeWindowUI.Instance?.Toggle();
         }
 
@@ -346,16 +327,8 @@ namespace RPG.Network
         {
             if (UIInputUtils.IsTypingInInputField()) return;
 
-            if (Input.GetKeyDown(KeyCode.I))
-            {
-                EnsureCursorVisible();
-                InventoryUI.Instance?.Toggle();
-            }
-            if (Input.GetKeyDown(KeyCode.P))
-            {
-                EnsureCursorVisible();
-                PowerGemUI.Instance?.Toggle();
-            }
+            if (Input.GetKeyDown(KeyCode.I)) { EnsureCursorVisible(); InventoryUI.Instance?.Toggle(); }
+            if (Input.GetKeyDown(KeyCode.P)) { EnsureCursorVisible(); PowerGemUI.Instance?.Toggle(); }
         }
 
         private void EnsureCursorVisible()
@@ -368,7 +341,7 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Câmera
+        // Câmera (inalterada)
         // ══════════════════════════════════════════════════════════════════
 
         private void HandleCameraOrbit()
@@ -391,7 +364,6 @@ namespace RPG.Network
                 _yaw   += Input.GetAxis("Mouse X") * orbitSensitivity;
                 _pitch -= Input.GetAxis("Mouse Y") * orbitSensitivity;
                 _pitch  = Mathf.Clamp(_pitch, PITCH_MIN, PITCH_MAX);
-
                 if (_yaw > 360f)  _yaw -= 360f;
                 if (_yaw < -360f) _yaw += 360f;
             }
@@ -409,21 +381,16 @@ namespace RPG.Network
             Vector3    dir   = rot * new Vector3(0f, 0f, -1f);
 
             float effectiveDistance = _distance;
-            int   occlusionMask = cameraOcclusionLayer != 0
-                ? (int)cameraOcclusionLayer
-                : (int)terrainLayer;
+            int   occlusionMask = cameraOcclusionLayer != 0 ? (int)cameraOcclusionLayer : (int)terrainLayer;
 
             if (occlusionMask != 0
-                && Physics.SphereCast(pivot, CAM_SKIN_WIDTH, dir, out RaycastHit camHit,
-                                      _distance, occlusionMask))
+                && Physics.SphereCast(pivot, CAM_SKIN_WIDTH, dir, out RaycastHit camHit, _distance, occlusionMask))
             {
                 effectiveDistance = Mathf.Max(DIST_MIN, camHit.distance - CAM_SKIN_WIDTH);
             }
 
             Vector3 target = pivot + dir * effectiveDistance;
-
-            if (target.y < transform.position.y + 0.5f)
-                target.y = transform.position.y + 0.5f;
+            if (target.y < transform.position.y + 0.5f) target.y = transform.position.y + 0.5f;
 
             _cam.transform.position = Vector3.SmoothDamp(
                 _cam.transform.position, target, ref _camVelocity, cameraSmoothTime);
@@ -431,40 +398,32 @@ namespace RPG.Network
         }
 
         // ══════════════════════════════════════════════════════════════════
-        // Commands
+        // Commands (anti-cheat inalterado)
         // ══════════════════════════════════════════════════════════════════
 
         [Command]
         public void CmdMoveTo(Vector3 destination)
         {
-            // Sanity: rejeita NaN/Infinity de cliente malformado
             if (float.IsNaN(destination.x) || float.IsInfinity(destination.x)
                 || float.IsNaN(destination.y) || float.IsInfinity(destination.y)
                 || float.IsNaN(destination.z) || float.IsInfinity(destination.z))
             {
-                Debug.LogWarning($"[Security] CmdMoveTo com coordenadas inválidas.");
+                Debug.LogWarning("[Security] CmdMoveTo com coordenadas inválidas.");
                 return;
             }
 
             var netPlayer = GetComponent<NetworkPlayer>();
             if (netPlayer == null || netPlayer.Dead) return;
 
-            // --- Anti-SpeedHack Validation ---
-            // 1. Valida o movimento REAL realizado desde o último comando recebido.
-            // Isso fecha o buraco onde o jogador atualizava a posição de segurança para o destino
-            // antes mesmo de chegar lá, permitindo "teletransporte legal".
             float timePassed = Time.time - _serverLastMoveTime;
-            if (timePassed > 0.05f) 
+            if (timePassed > 0.05f)
             {
                 float actualDistMoved = Vector3.Distance(_serverLastPosition, transform.position);
-                float maxSpeed  = (_playerEntity != null && _playerEntity.Stats != null) 
-                    ? _playerEntity.Stats.MoveSpeed 
-                    : AGENT_MAX_SPEED;
+                float maxSpeed = (_playerEntity != null && _playerEntity.Stats != null)
+                    ? _playerEntity.Stats.MoveSpeed : AGENT_MAX_SPEED;
 
-                // Tolerância inclui margem para latência e jitter. 
-                // Removemos o MIN_CHECK_DISTANCE para evitar sucessivos micro-teleportes abaixo do radar.
                 float maxAllowedDist = (maxSpeed * timePassed * SPEED_HACK_TOLERANCE) + 0.5f;
-                
+
                 if (actualDistMoved > maxAllowedDist)
                 {
                     if (Time.time - _lastSecurityWarnTime >= SECURITY_WARN_INTERVAL)
@@ -472,14 +431,11 @@ namespace RPG.Network
                         _lastSecurityWarnTime = Time.time;
                         Debug.LogWarning($"[Security] Movimento suspeito: {netPlayer.CharacterName} | Real: {actualDistMoved:0.1} | Max: {maxAllowedDist:0.1} | T: {timePassed:0.00}s");
                     }
-                    
-                    // Rubberbanding imediato: volta o jogador para a última posição segura conhecida pelo servidor
                     _agent.Warp(_serverLastPosition);
                     return;
                 }
             }
 
-            // 2. Validação de Bounds / NavMesh do DESTINO
             Vector3 finalDest = destination;
             if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2.0f, NavMesh.AllAreas))
             {
@@ -492,7 +448,6 @@ namespace RPG.Network
                 return;
             }
 
-            // 3. Limite de distância do clique (anti-map-warp)
             float totalDist = Vector3.Distance(transform.position, finalDest);
             if (totalDist > MAX_MOVE_DIST)
             {
@@ -504,15 +459,13 @@ namespace RPG.Network
                 return;
             }
 
-            // Atualiza o checkpoint de segurança ANTES de mudar o destino do agent.
-            // O próximo CmdMoveTo validará se o deslocamento até aqui foi condizente com o tempo.
             _serverLastPosition = transform.position;
             _serverLastMoveTime = Time.time;
 
             if (_agent != null && _agent.isOnNavMesh)
             {
                 _agent.SetDestination(finalDest);
-                _agent.speed = (_playerEntity != null && _playerEntity.Stats != null) 
+                _agent.speed = (_playerEntity != null && _playerEntity.Stats != null)
                     ? Mathf.Clamp(_playerEntity.Stats.MoveSpeed, AGENT_MIN_SPEED, AGENT_MAX_SPEED)
                     : AGENT_MAX_SPEED;
             }
@@ -528,8 +481,9 @@ namespace RPG.Network
             if (!value)
             {
                 _holdMoving = false;
-                _basicAttack?.CancelAutoAttack();
-                _skillSystem?.CancelPendingWalk();
+                _attackHeld = false;
+                _basicAttack?.ReleaseAttack();
+                _skillSystem?.CancelCast();
 
                 _orbiting        = false;
                 Cursor.visible   = true;
@@ -537,26 +491,17 @@ namespace RPG.Network
             }
         }
 
-        /// <summary>
-        /// Sincroniza a posição de segurança do servidor. Use após Warps/Teleportes
-        /// autoritativos para evitar disparos falsos do anti-cheat.
-        /// </summary>
         public void ServerSyncSafetyPosition(Vector3 pos)
         {
             _serverLastPosition = pos;
             _serverLastMoveTime = Time.time;
         }
 
-        // ══════════════════════════════════════════════════════════════════
-        // Helpers
-        // ══════════════════════════════════════════════════════════════════
-
         private void SpawnMoveIndicator(Vector3 pos)
         {
             if (moveIndicatorPrefab == null) return;
             var go = Instantiate(moveIndicatorPrefab,
-                pos + Vector3.up * 0.02f,
-                Quaternion.Euler(90f, 0f, 0f));
+                pos + Vector3.up * 0.02f, Quaternion.Euler(90f, 0f, 0f));
             Destroy(go, 0.8f);
         }
     }

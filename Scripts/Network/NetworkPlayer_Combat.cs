@@ -180,62 +180,6 @@ namespace RPG.Network
             ServerRespawn();
         }
 
-        [Command]
-        public void CmdRequestSelfSkill(int skillIndex)
-        {
-            if (connectionToClient == null) return;
-
-            if (Dead || _serverStats == null) return;
-            if (skillIndex < 0 || skillIndex >= NetworkInventory.GEM_SLOT_COUNT) return;
-
-            var skill = _inventory?.GetEquippedSkill(skillIndex);
-            if (skill == null)
-            {
-                RpcSkillRejected(skillIndex, "Nenhuma joia equipada neste slot.");
-                return;
-            }
-
-            if (skill.Target != Combat.SkillTarget.Self
-                && skill.Type != Combat.SkillType.Heal
-                && skill.Type != Combat.SkillType.Buff)
-            {
-                RpcSkillRejected(skillIndex, "Esta skill precisa de um alvo.");
-                return;
-            }
-
-            if (!ServerCheckAndSetCooldown(skillIndex, skill.Cooldown))
-            {
-                if (_cooldowns != null && _cooldowns.TryGetSkillEndTime(skillIndex, out float endTime))
-                    RpcSkillRejected(skillIndex, $"{skill.Name}: aguarde {endTime - Time.time:0.0}s");
-                return;
-            }
-
-            if (CurrentMP < skill.ManaCost)
-            {
-                RpcSkillRejected(skillIndex, "MP insuficiente!");
-                return;
-            }
-
-            ServerConsumeMP(skill.ManaCost);
-
-            if (skill.Type == Combat.SkillType.Heal)
-            {
-                float heal = Mathf.Max(10f, _serverStats.MATK * skill.AtkMultiplier);
-                heal = SanitizeAmount(heal);
-                float before = CurrentHP;
-                CurrentHP    = Mathf.Min(MaxHP, CurrentHP + heal);
-                float healed = CurrentHP - before;
-
-                if (_serverCharData != null) _serverCharData.CurrentHP = CurrentHP;
-                if (healed > 0f) RpcShowHeal(healed);
-            }
-
-            if (!string.IsNullOrEmpty(skill.AnimTrigger))
-                RpcPlayAnimation(skill.AnimTrigger);
-
-            RpcSkillConfirmed(skillIndex, skill.Cooldown);
-        }
-
         private RegenSnapshot BuildRegenSnapshot()
         {
             return new RegenSnapshot

@@ -8,19 +8,23 @@ using RPG.Data;
 
 namespace RPG.Combat
 {
-
+    /// <summary>
+    /// Ataque básico ARPG-style: SEGURE o botão sobre um inimigo para atacar.
+    ///
+    /// MUDANÇAS vs. versão antiga:
+    ///   • Sem duplo-clique. O controller chama HoldAttack(monster) a cada frame
+    ///     enquanto o botão estiver pressionado e o cursor sobre um inimigo vivo,
+    ///     e ReleaseAttack() ao soltar.
+    ///   • Persegue até o range da arma e ataca na cadência do ASPD.
+    ///   • Não depende mais de "alvo selecionado" travado nem do walk-to-skill.
+    /// </summary>
     [RequireComponent(typeof(PlayerEntity))]
     [RequireComponent(typeof(NetworkIdentity))]
     public class BasicAttackSystem : NetworkBehaviour
     {
-        [Header("Configuração Geral")]
-        [Tooltip("Janela para reconhecer duplo-clique (s).")]
-        [SerializeField] private float doubleClickTime = 0.35f;
-
-        [Tooltip("Frequência máxima de envio de CmdMoveTo durante perseguição (s).")]
+        [Header("Perseguição")]
+        [Tooltip("Frequência de envio de CmdMoveTo durante a perseguição (s).")]
         [SerializeField] private float moveCommandInterval = 0.18f;
-
-        [Tooltip("Distância mínima para considerar troca de destino na perseguição.")]
         [SerializeField] private float chaseRedirectThreshold = 0.5f;
 
         private const float DEST_FRACTION      = 0.80f;
@@ -32,35 +36,27 @@ namespace RPG.Combat
         private const float ROTATION_SPEED     = 12f;
         private const float DEFAULT_INTERVAL   = 1.2f;
 
-        // ── Componentes ────────────────────────────────────────────────────
         private PlayerEntity            _player;
         private NavMeshAgent            _agent;
         private Animator                _animator;
         private NetworkPlayerController _controller;
-        private SkillSystem             _skillSystem;
         private NetworkIdentity         _identity;
         private NetworkInventory        _inventory;
 
-        // ── Estado ─────────────────────────────────────────────────────────
         private NetworkMonsterEntity _attackTarget;
-        private bool                 _autoAttacking;
+        private bool                 _attacking;
         private float                _attackTimer;
         private float                _lastMoveCmd;
         private Vector3              _lastChaseDestination = Vector3.positiveInfinity;
 
-        private float                _lastClickTime = -999f;
-        private NetworkMonsterEntity _lastClickTarget;
-
         private WeaponAttackProfile _currentProfile;
-
         private float _cachedAttackInterval = DEFAULT_INTERVAL;
         private bool  _attackIntervalDirty  = true;
 
-        // ── Subscrições para cleanup ───────────────────────────────────────
-        private bool _subscribedToPlayerEvents;
-        private bool _subscribedToInventoryEvents;
+        private bool _subscribedPlayer;
+        private bool _subscribedInventory;
 
-        public bool  IsAutoAttacking => _autoAttacking;
+        public bool  IsAutoAttacking => _attacking;
         public float AttackRange     => _currentProfile?.Range ?? 2.5f;
         public WeaponAttackProfile CurrentProfile => _currentProfile;
 
@@ -70,148 +66,73 @@ namespace RPG.Combat
 
         private void Awake()
         {
-            _player      = GetComponent<PlayerEntity>();
-            _agent       = GetComponent<NavMeshAgent>();
-            _animator    = GetComponentInChildren<Animator>();
-            _controller  = GetComponent<NetworkPlayerController>();
-            _skillSystem = GetComponent<SkillSystem>();
-            _identity    = GetComponent<NetworkIdentity>();
-            _inventory   = GetComponent<NetworkInventory>();
+            _player     = GetComponent<PlayerEntity>();
+            _agent      = GetComponent<NavMeshAgent>();
+            _animator   = GetComponentInChildren<Animator>();
+            _controller = GetComponent<NetworkPlayerController>();
+            _identity   = GetComponent<NetworkIdentity>();
+            _inventory  = GetComponent<NetworkInventory>();
 
             _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
         }
 
         public override void OnStartLocalPlayer()
         {
-            SubscribeToPlayerEvents();
-            SubscribeToInventoryEvents();
+            SubscribePlayer();
+            SubscribeInventory();
             RefreshWeaponProfile();
-            InvalidateAttackIntervalCache();
+            _attackIntervalDirty = true;
         }
 
         public override void OnStopClient()
         {
-            UnsubscribeFromPlayerEvents();
-            UnsubscribeFromInventoryEvents();
-            CancelAutoAttackSoft();
-        }
-
-        private void OnDisable()
-        {
-            if (_autoAttacking) CancelAutoAttackSoft();
+            UnsubscribePlayer();
+            UnsubscribeInventory();
+            StopAttacking();
         }
 
         private void OnDestroy()
         {
-            UnsubscribeFromPlayerEvents();
-            UnsubscribeFromInventoryEvents();
+            UnsubscribePlayer();
+            UnsubscribeInventory();
         }
 
-        private void SubscribeToPlayerEvents()
+        private void SubscribePlayer()
         {
-            if (_subscribedToPlayerEvents || _player == null) return;
-
-            _player.OnDeathChanged  += OnPlayerDeathChanged;
-            _player.OnTargetChanged += OnPlayerTargetChanged;
-            _player.OnStatsChanged  += OnPlayerStatsChanged;
-            _player.OnInitialized   += OnPlayerInitialized;
-
-            _subscribedToPlayerEvents = true;
+            if (_subscribedPlayer || _player == null) return;
+            _player.OnDeathChanged += OnPlayerDeathChanged;
+            _player.OnStatsChanged += OnPlayerStatsChanged;
+            _subscribedPlayer = true;
         }
 
-        private void UnsubscribeFromPlayerEvents()
+        private void UnsubscribePlayer()
         {
-            if (!_subscribedToPlayerEvents || _player == null) return;
-
-            _player.OnDeathChanged  -= OnPlayerDeathChanged;
-            _player.OnTargetChanged -= OnPlayerTargetChanged;
-            _player.OnStatsChanged  -= OnPlayerStatsChanged;
-            _player.OnInitialized   -= OnPlayerInitialized;
-
-            _subscribedToPlayerEvents = false;
+            if (!_subscribedPlayer || _player == null) return;
+            _player.OnDeathChanged -= OnPlayerDeathChanged;
+            _player.OnStatsChanged -= OnPlayerStatsChanged;
+            _subscribedPlayer = false;
         }
 
-        private void SubscribeToInventoryEvents()
+        private void SubscribeInventory()
         {
-            if (_subscribedToInventoryEvents || _inventory == null) return;
+            if (_subscribedInventory || _inventory == null) return;
             _inventory.OnEquipmentChanged += OnEquipmentChanged;
-            _subscribedToInventoryEvents = true;
+            _subscribedInventory = true;
         }
 
-        private void UnsubscribeFromInventoryEvents()
+        private void UnsubscribeInventory()
         {
-            if (!_subscribedToInventoryEvents || _inventory == null) return;
+            if (!_subscribedInventory || _inventory == null) return;
             _inventory.OnEquipmentChanged -= OnEquipmentChanged;
-            _subscribedToInventoryEvents = false;
+            _subscribedInventory = false;
         }
 
-        private void OnPlayerDeathChanged(bool isDead)
-        {
-            if (isDead && _autoAttacking)
-            {
-                Log("Player morreu — auto-ataque cancelado.");
-                CancelAutoAttack();
-            }
-
-            if (isDead)
-            {
-                _lastClickTime   = -999f;
-                _lastClickTarget = null;
-            }
-        }
-
-        private void OnPlayerTargetChanged(ITargetable newTarget)
-        {
-            if (_autoAttacking && newTarget != (ITargetable)_attackTarget)
-                CancelAutoAttackSoft();
-        }
-
-        private void OnPlayerStatsChanged()
-        {
-            InvalidateAttackIntervalCache();
-        }
-
-        private void OnPlayerInitialized()
-        {
-            InvalidateAttackIntervalCache();
-        }
+        private void OnPlayerDeathChanged(bool isDead) { if (isDead) StopAttacking(); }
+        private void OnPlayerStatsChanged()            { _attackIntervalDirty = true; }
 
         private void OnEquipmentChanged()
         {
-            var oldProfile = _currentProfile;
             RefreshWeaponProfile();
-            InvalidateAttackIntervalCache();
-
-            if (_autoAttacking && oldProfile != _currentProfile)
-            {
-                _lastChaseDestination = Vector3.positiveInfinity;
-                _attackTimer          = GetAttackInterval();
-
-                if (_attackTarget != null && _currentProfile != null)
-                {
-                    float dist = Vector3.Distance(transform.position, _attackTarget.Position);
-                    float effectiveRange = _currentProfile.Range * RANGE_CHECK_MARGIN;
-
-                    if (dist > effectiveRange)
-                    {
-                        Log($"Troca de arma → alvo a {dist:0.0}m, novo range {_currentProfile.Range:0.0}m. " +
-                            "Forçando modo chase.");
-                        if (_agent != null && _agent.isOnNavMesh && !_agent.hasPath)
-                        {
-                            _agent.ResetPath();
-                            _agent.stoppingDistance = CHASE_STOP_DIST;
-                        }
-                    }
-                    else
-                    {
-                        Log($"Troca de arma → ainda em range.");
-                    }
-                }
-            }
-        }
-
-        private void InvalidateAttackIntervalCache()
-        {
             _attackIntervalDirty = true;
         }
 
@@ -227,19 +148,13 @@ namespace RPG.Combat
             if (string.IsNullOrEmpty(weaponId))
             {
                 _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
-                Log("Sem arma — usando perfil Unarmed.");
                 return;
             }
 
             var item = ItemDatabase.Instance?.GetItem(weaponId);
-            if (item == null || !item.IsWeapon)
-            {
-                _currentProfile = WeaponAttackProfile.Default(WeaponType.Unarmed);
-                return;
-            }
-
-            _currentProfile = item.GetEffectiveAttackProfile();
-            Log($"Arma equipada: {item.DisplayName} ({_currentProfile.Type}, range {_currentProfile.Range:0.0})");
+            _currentProfile = (item != null && item.IsWeapon)
+                ? item.GetEffectiveAttackProfile()
+                : WeaponAttackProfile.Default(WeaponType.Unarmed);
         }
 
         private void Update()
@@ -247,103 +162,72 @@ namespace RPG.Combat
             if (!isLocalPlayer) return;
             if (_player == null || !_player.IsInitialized) return;
 
-            if (_player.IsDead)
-            {
-                if (_autoAttacking) CancelAutoAttack();
-                return;
-            }
+            if (_player.IsDead) { if (_attacking) StopAttacking(); return; }
 
-            // FIX: limpa _lastClickTarget destruído para evitar reuse de ponteiro obsoleto
-            if (_lastClickTarget != null && IsTargetGone(_lastClickTarget))
-            {
-                _lastClickTarget = null;
-                _lastClickTime   = -999f;
-            }
-
-            if (_autoAttacking) UpdateAutoAttack();
+            if (_attacking) UpdateAttack();
         }
 
-        // ── API pública ────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // API pública (chamada pelo controller enquanto o botão está pressionado)
+        // ══════════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Registra clique num monstro. Duplo-clique inicia auto-ataque.
-        /// FIX: verifica IsTargetDestroyedOrDead (Unity-null + IsDead) antes de processar.
+        /// Mantém o ataque sobre 'monster'. Chame todo frame enquanto o botão
+        /// de ataque estiver pressionado e o cursor sobre um inimigo vivo.
         /// </summary>
-        public bool TryRegisterClick(NetworkMonsterEntity monster)
+        public void HoldAttack(NetworkMonsterEntity monster)
         {
-            // FIX: IsTargetGone agora verifica tanto Unity-destroyed quanto IsDead
-            if (IsTargetGone(monster)) return false;
-
-            float now           = Time.time;
-            bool  isDoubleClick = (now - _lastClickTime) <= doubleClickTime
-                                  && _lastClickTarget == monster;
-
-            _lastClickTime   = now;
-            _lastClickTarget = monster;
-
-            if (isDoubleClick)
-            {
-                StartAutoAttack(monster);
-                return true;
-            }
-            return false;
+            if (IsGone(monster)) return;
+            if (!_attacking || _attackTarget != monster)
+                BeginAttack(monster);
         }
 
-        public void CancelAutoAttack()
+        /// <summary>Solte o botão de ataque.</summary>
+        public void ReleaseAttack() => StopAttacking();
+
+        /// <summary>Para o ataque sem mexer no agente (cancelamento suave).</summary>
+        public void CancelAutoAttackSoft()
         {
-            if (!_autoAttacking) return;
+            _attacking            = false;
+            _attackTarget         = null;
+            _attackTimer          = 0f;
+            _lastChaseDestination = Vector3.positiveInfinity;
+        }
+
+        /// <summary>Para o ataque e zera o movimento.</summary>
+        public void CancelAutoAttack() => StopAttacking();
+
+        private void StopAttacking()
+        {
+            if (!_attacking) return;
             CancelAutoAttackSoft();
             StopAgentMovement();
         }
 
-        public void CancelAutoAttackSoft()
-        {
-            if (!_autoAttacking) return;
-
-            _autoAttacking        = false;
-            _attackTarget         = null;
-            _attackTimer          = 0f;
-            _lastChaseDestination = Vector3.positiveInfinity;
-            Log("Auto-ataque cancelado (soft).");
-        }
-
-        // ── Início ─────────────────────────────────────────────────────────
-
-        private void StartAutoAttack(NetworkMonsterEntity monster)
+        private void BeginAttack(NetworkMonsterEntity monster)
         {
             RefreshWeaponProfile();
-            InvalidateAttackIntervalCache();
-
-            _skillSystem?.CancelPendingWalkSoft();
-            CancelAutoAttackSoft();
-
+            _attackIntervalDirty  = true;
             _attackTarget         = monster;
-            _autoAttacking        = true;
-            _attackTimer          = GetAttackInterval();
+            _attacking            = true;
+            _attackTimer          = GetAttackInterval(); // ataca quase imediato
             _lastChaseDestination = Vector3.positiveInfinity;
 
             _player.SetTarget(monster);
             UIManager.Instance?.UpdateTargetPanel(monster);
-
-            Log($"Auto-ataque iniciado ({_currentProfile.Type}) → {monster.DisplayName}");
         }
 
-        // ── Loop principal ─────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // Loop
+        // ══════════════════════════════════════════════════════════════════
 
-        private void UpdateAutoAttack()
+        private void UpdateAttack()
         {
-            if (IsTargetGone(_attackTarget))
+            if (IsGone(_attackTarget))
             {
-                Log("Alvo destruído ou morto — cancelando.");
-                CancelAutoAttack();
+                StopAttacking();
                 _player.ClearTarget();
                 UIManager.Instance?.ClearTargetPanel();
-                return;
-            }
-
-            if (!IsCurrentTargetStillSame())
-            {
-                CancelAutoAttackSoft();
                 return;
             }
 
@@ -351,13 +235,11 @@ namespace RPG.Combat
             float range          = _currentProfile.Range;
             float effectiveRange = range * RANGE_CHECK_MARGIN;
 
-            if (dist > effectiveRange)
-                ChaseTarget(range);
-            else
-                AttackTarget();
+            if (dist > effectiveRange) ChaseTarget(range);
+            else                       AttackInRange();
         }
 
-        private void AttackTarget()
+        private void AttackInRange()
         {
             if (_agent != null && _agent.isOnNavMesh && _agent.hasPath)
             {
@@ -379,13 +261,11 @@ namespace RPG.Combat
         private void RotateTowardsTarget()
         {
             if (_attackTarget == null) return;
-
             Vector3 dir = _attackTarget.Position - transform.position;
             dir.y = 0f;
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.Slerp(
-                    transform.rotation,
-                    Quaternion.LookRotation(dir),
+                    transform.rotation, Quaternion.LookRotation(dir),
                     ROTATION_SPEED * Time.deltaTime);
         }
 
@@ -413,71 +293,49 @@ namespace RPG.Combat
         {
             Vector3 toTarget = targetPos - transform.position;
             float   dist     = toTarget.magnitude;
+            float   safe     = weaponRange * DEST_FRACTION;
 
-            float safeStopDist = weaponRange * DEST_FRACTION;
-            if (dist <= safeStopDist * 0.95f)
-                return transform.position;
+            if (dist <= safe * 0.95f) return transform.position;
 
-            Vector3 direction   = toTarget.normalized;
-            Vector3 destination = targetPos - direction * safeStopDist;
-
+            Vector3 destination = targetPos - toTarget.normalized * safe;
             if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
                 return hit.position;
-
             return destination;
         }
 
-        // ── Execução do ataque ─────────────────────────────────────────────
-
         private void ExecuteBasicAttack()
         {
-            if (IsTargetGone(_attackTarget)) return;
-            if (_identity == null) return;
+            if (IsGone(_attackTarget) || _identity == null) return;
 
-            // FIX (Bug 3): Validação de MP no cliente para evitar spam de Cmd e animação sem efeito
             if (_currentProfile.ManaCost > 0f && _player.CurrentMP < _currentProfile.ManaCost)
             {
                 UIManager.Instance?.ShowMessage("<color=red>MP insuficiente!</color>");
-                CancelAutoAttackSoft();
+                StopAttacking();
                 return;
             }
 
-            string animTrigger = !string.IsNullOrEmpty(_currentProfile.AnimTrigger)
-                ? _currentProfile.AnimTrigger
-                : "Attack";
-            
-            CmdPlayAttackAnimation(animTrigger);
+            string trigger = !string.IsNullOrEmpty(_currentProfile.AnimTrigger)
+                ? _currentProfile.AnimTrigger : "Attack";
+            CmdPlayAttackAnimation(trigger);
 
             _attackTarget.CmdBasicAttack(_identity.netId, _currentProfile.Range);
-
-            Log($"CmdBasicAttack → {_attackTarget.DisplayName} (perfil: {_currentProfile.Type})");
         }
 
-        [Command]
-        private void CmdPlayAttackAnimation(string triggerName)
-        {
-            RpcPlayAttackAnimation(triggerName);
-        }
+        [Command] private void CmdPlayAttackAnimation(string t) => RpcPlayAttackAnimation(t);
+        [ClientRpc] private void RpcPlayAttackAnimation(string t) { if (_animator != null) _animator.SetTrigger(t); }
 
-        [ClientRpc]
-        private void RpcPlayAttackAnimation(string triggerName)
-        {
-            if (_animator == null) return;
-            _animator.SetTrigger(triggerName);
-        }
-
-        // ── Helpers ────────────────────────────────────────────────────────
+        // ══════════════════════════════════════════════════════════════════
+        // Helpers
+        // ══════════════════════════════════════════════════════════════════
 
         private float GetAttackInterval()
         {
             if (!_attackIntervalDirty) return _cachedAttackInterval;
-
             float baseInterval = DEFAULT_INTERVAL;
             if (_player != null && _player.IsInitialized && _player.Stats != null)
                 baseInterval = 1f / Mathf.Max(0.1f, _player.Stats.ASPD);
-
-            float modifier = _currentProfile?.AttackIntervalMultiplier ?? 1f;
-            _cachedAttackInterval = Mathf.Clamp(baseInterval * modifier, MIN_INTERVAL, MAX_INTERVAL);
+            float mod = _currentProfile?.AttackIntervalMultiplier ?? 1f;
+            _cachedAttackInterval = Mathf.Clamp(baseInterval * mod, MIN_INTERVAL, MAX_INTERVAL);
             _attackIntervalDirty  = false;
             return _cachedAttackInterval;
         }
@@ -490,53 +348,14 @@ namespace RPG.Combat
             _lastChaseDestination   = Vector3.positiveInfinity;
         }
 
-        private bool IsCurrentTargetStillSame()
-        {
-            if (_player.CurrentTarget == null) return false;
-            var current = _player.CurrentTarget as NetworkMonsterEntity;
-            return current == _attackTarget && current != null;
-        }
-
-        /// <summary>
-        /// FIX: verifica tanto o Unity null (objeto destruído pelo GC/NetworkServer.Destroy)
-        /// quanto IsDead. Antes só verificava IsDead, causando NullReferenceException
-        /// quando o monstro era destruído antes do respawn.
-        /// </summary>
-        private static bool IsTargetGone(NetworkMonsterEntity target)
-        {
-            // Verificação de Unity null primeiro (operador == sobrecarregado pelo Unity)
-            if (target == null) return true;
-            // Verificação de morte lógica
-            return target.IsDead;
-        }
-
-        private void Log(string msg)
-        {
-#if UNITY_EDITOR || DEVELOPMENT_BUILD
-            // Log desativado para limpeza, reative se necessário
-            // Debug.Log($"[BasicAttackSystem] {msg}");
-#endif
-        }
+        private static bool IsGone(NetworkMonsterEntity t) => t == null || t.IsDead;
 
 #if UNITY_EDITOR
         private void OnDrawGizmosSelected()
         {
             float r = _currentProfile?.Range ?? 2.5f;
-
-            Color rangeColor = new Color(1f, 0.5f, 0f, 0.4f);
-            if (_currentProfile != null)
-            {
-                if (_currentProfile.UsesProjectile && !_currentProfile.IsPhysical)
-                    rangeColor = new Color(0.3f, 0.6f, 1f, 0.4f);
-                else if (_currentProfile.UsesProjectile)
-                    rangeColor = new Color(0.7f, 1f, 0.3f, 0.4f);
-            }
-
-            Gizmos.color = rangeColor;
+            Gizmos.color = new Color(1f, 0.5f, 0f, 0.4f);
             Gizmos.DrawWireSphere(transform.position, r);
-
-            Gizmos.color = new Color(0f, 1f, 0.5f, 0.25f);
-            Gizmos.DrawWireSphere(transform.position, r * DEST_FRACTION);
         }
 #endif
     }
