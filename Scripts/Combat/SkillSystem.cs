@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using UnityEngine;
+using UnityEngine.AI;
 using Mirror;
 using RPG.Character;
 using RPG.UI;
@@ -14,10 +15,15 @@ namespace RPG.Combat
     ///
     /// MUDANÇAS vs. versão antiga:
     ///   • SEM target-lock obrigatório. A mira vem do CURSOR no momento do uso.
-    ///   • SEM walk-to-range. A skill dispara de onde o player está.
     ///   • Cast instantâneo é o padrão. CastTime > 0 só p/ skills pesadas e,
     ///     por padrão, NÃO é cancelado por movimento (configurável na skill).
     ///   • Comando vai para o PLAYER (CmdUseSkill), não para o monstro.
+    ///
+    /// NOVO:
+    ///   • Walk-to-skill APENAS para TargetEnemy: se o inimigo sob o cursor está
+    ///     fora de alcance, o player anda até o range e então conjura.
+    ///   • Cura (SelfCast + Heal): não dispara se o HP já está cheio (predição
+    ///     no cliente; o servidor revalida).
     ///
     /// Modos de mira (resolvidos aqui no cliente):
     ///   SelfCast / AroundSelf → sem mira.
@@ -49,10 +55,12 @@ namespace RPG.Combat
         private float _bufferTimestamp    = -1f;
 
         // ── Componentes ────────────────────────────────────────────────────
-        private PlayerEntity     _player;
-        private Animator         _animator;
-        private NetworkInventory _inventory;
-        private RPG.Network.NetworkPlayer    _netPlayer;
+        private PlayerEntity            _player;
+        private Animator                _animator;
+        private NetworkInventory        _inventory;
+        private RPG.Network.NetworkPlayer       _netPlayer;
+        private NavMeshAgent            _agent;
+        private NetworkPlayerController _controller;
 
         // ── Cooldown visual ────────────────────────────────────────────────
         private readonly float[] _uiCooldownTimers = new float[MAX_SKILLS];
@@ -68,6 +76,20 @@ namespace RPG.Combat
         private Vector3   _lastBeamDir;
         private const float BEAM_AIM_SEND_INTERVAL = 0.05f; // ~20 Hz
         private float     _beamSendTimer;
+
+        // ── Walk-to-range (somente skills TargetEnemy) ──────────────────────
+        private const float APPROACH_MOVE_INTERVAL       = 0.18f;
+        private const float APPROACH_REDIRECT_THRESHOLD  = 0.4f;
+        private const float APPROACH_DEST_FRACTION        = 0.85f;
+        private const float APPROACH_TIMEOUT             = 8f;
+        private const float SKILL_RANGE_TOLERANCE_CLIENT = 1.1f;
+
+        private bool                 _approachActive;
+        private int                  _approachSkillIndex = -1;
+        private NetworkMonsterEntity _approachTarget;
+        private float                _approachStartedAt;
+        private float                _approachLastMoveCmd;
+        private Vector3              _approachLastChaseDest = Vector3.positiveInfinity;
 
         private bool _subscribedPlayer;
         private bool _subscribedInventory;
@@ -89,10 +111,12 @@ namespace RPG.Combat
 
         private void Awake()
         {
-            _player    = GetComponent<PlayerEntity>();
-            _animator  = GetComponentInChildren<Animator>();
-            _inventory = GetComponent<NetworkInventory>();
-            _netPlayer = GetComponent<RPG.Network.NetworkPlayer>();
+            _player     = GetComponent<PlayerEntity>();
+            _animator   = GetComponentInChildren<Animator>();
+            _inventory  = GetComponent<NetworkInventory>();
+            _netPlayer  = GetComponent<RPG.Network.NetworkPlayer>();
+            _agent      = GetComponent<NavMeshAgent>();
+            _controller = GetComponent<NetworkPlayerController>();
         }
 
         public override void OnStartLocalPlayer()
@@ -106,6 +130,7 @@ namespace RPG.Combat
             UnsubscribeInventory();
             UnsubscribePlayer();
             CancelCast();
+            CancelPendingApproach();
         }
 
         private void OnDestroy()
@@ -113,6 +138,7 @@ namespace RPG.Combat
             UnsubscribeInventory();
             UnsubscribePlayer();
             CancelCast();
+            CancelPendingApproach();
         }
 
         private void SubscribeInventory()
@@ -150,7 +176,7 @@ namespace RPG.Combat
 
         private void OnPlayerDeathChanged(bool isDead)
         {
-            if (isDead) CancelCast();
+            if (isDead) { CancelCast(); CancelPendingApproach(); }
         }
 
         private void Update()
@@ -179,6 +205,7 @@ namespace RPG.Combat
             if (_isCasting && _player.IsDead) CancelCast();
 
             TickBeamChannel();
+            TickApproach();
         }
 
         // ══════════════════════════════════════════════════════════════════
@@ -237,6 +264,27 @@ namespace RPG.Combat
             {
                 Log($"BLOQUEADO: em cooldown ({GetUICooldown(index):0.0}s).");
                 UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(index):0.0}s");
+                return;
+            }
+
+            // Novo comando cancela uma aproximação pendente anterior.
+            CancelPendingApproach();
+
+            // Cura: predição cliente — não dispara com HP cheio (servidor revalida).
+            if (skill.Type == SkillType.Heal
+                && skill.AimMode == SkillAimMode.SelfCast
+                && _player.Stats != null
+                && _player.CurrentHP >= _player.Stats.MaxHP - 0.01f)
+            {
+                Log("BLOQUEADO: HP já está cheio (cura).");
+                UIManager.Instance?.ShowMessage("Você já está com HP máximo!");
+                return;
+            }
+
+            // Walk-to-range: skill TargetEnemy com alvo fora de alcance → anda até chegar.
+            if (skill.NeedsEnemy && TryFindEnemyOutOfRange(skill, out NetworkMonsterEntity approachTarget))
+            {
+                BeginApproachAndCast(index, approachTarget);
                 return;
             }
 
@@ -389,6 +437,160 @@ namespace RPG.Combat
             if (dir.sqrMagnitude > 0.01f)
                 transform.rotation = Quaternion.LookRotation(dir);
         }
+
+        // ══════════════════════════════════════════════════════════════════
+        // Walk-to-skill (TargetEnemy fora de alcance)
+        // ══════════════════════════════════════════════════════════════════
+
+        // Retorna true SÓ se há um inimigo sob o cursor E ele está fora de alcance.
+        private bool TryFindEnemyOutOfRange(SkillData skill, out NetworkMonsterEntity monster)
+        {
+            monster = null;
+            Camera cam = _player.MainCamera != null ? _player.MainCamera : Camera.main;
+            if (cam == null) return false;
+            if (!TryRaycastEnemy(cam, out monster)) { monster = null; return false; }
+
+            float dist = Vector3.Distance(transform.position, monster.Position);
+            if (dist <= skill.Range * SKILL_RANGE_TOLERANCE_CLIENT)
+            {
+                monster = null;   // já está no alcance → ResolveAim conjura agora
+                return false;
+            }
+            return true;          // fora de alcance → precisa andar
+        }
+
+        private void BeginApproachAndCast(int index, NetworkMonsterEntity monster)
+        {
+            _approachActive        = true;
+            _approachSkillIndex    = index;
+            _approachTarget        = monster;
+            _approachStartedAt     = Time.time;
+            _approachLastMoveCmd   = 0f;
+            _approachLastChaseDest = Vector3.positiveInfinity;
+
+            _player.SetTarget(monster);
+            UIManager.Instance?.UpdateTargetPanel(monster);
+            Log($"Walk-to-skill: indo até o alcance para usar slot {index}.");
+        }
+
+        private void TickApproach()
+        {
+            if (!_approachActive) return;
+            if (_isCasting) return;
+
+            if (_player == null || _player.IsDead) { CancelApproach(); return; }
+
+            if (IsMonsterGone(_approachTarget))
+            {
+                CancelApproach();
+                _player.ClearTarget();
+                UIManager.Instance?.ClearTargetPanel();
+                return;
+            }
+
+            var skill = GetSkill(_approachSkillIndex);
+            if (skill == null || !skill.NeedsEnemy) { CancelApproach(); return; }
+
+            if (Time.time - _approachStartedAt > APPROACH_TIMEOUT)
+            {
+                StopApproachMovement();
+                CancelApproach();
+                UIManager.Instance?.ShowMessage("Não foi possível alcançar o alvo.");
+                return;
+            }
+
+            float dist  = Vector3.Distance(transform.position, _approachTarget.Position);
+            float range = skill.Range;
+
+            if (dist <= range)
+            {
+                var monster = _approachTarget;
+                int idx     = _approachSkillIndex;
+
+                StopApproachMovement();
+                CancelApproach();
+
+                if (IsOnUICooldown(idx))
+                {
+                    UIManager.Instance?.ShowMessage($"{skill.Name}: aguarde {GetUICooldown(idx):0.0}s");
+                    return;
+                }
+                if (_player.CurrentMP < skill.ManaCost)
+                {
+                    UIManager.Instance?.ShowMessage("<color=red>MP insuficiente!</color>");
+                    return;
+                }
+
+                var info = SkillCastInfo.ForTarget(idx, monster.netId);
+                FaceTowards(monster.Position);
+                StartCastAndSend(skill, info);
+                return;
+            }
+
+            ChaseForSkill(_approachTarget.Position, range);
+        }
+
+        private void ChaseForSkill(Vector3 targetPos, float range)
+        {
+            if (_agent == null || !_agent.isOnNavMesh) return;
+
+            Vector3 dest = CalculateApproachDestination(targetPos, range);
+
+            if (Vector3.Distance(dest, _approachLastChaseDest) >= APPROACH_REDIRECT_THRESHOLD)
+            {
+                _agent.stoppingDistance = 0.15f;
+                _agent.SetDestination(dest);
+                _approachLastChaseDest = dest;
+            }
+
+            if (Time.time - _approachLastMoveCmd >= APPROACH_MOVE_INTERVAL)
+            {
+                _approachLastMoveCmd = Time.time;
+                _controller?.CmdMoveTo(dest);
+            }
+        }
+
+        private Vector3 CalculateApproachDestination(Vector3 targetPos, float range)
+        {
+            Vector3 toTarget = targetPos - transform.position;
+            float   dist     = toTarget.magnitude;
+            float   safe     = range * APPROACH_DEST_FRACTION;
+
+            if (dist <= safe * 0.95f) return transform.position;
+
+            Vector3 destination = targetPos - toTarget.normalized * safe;
+            if (NavMesh.SamplePosition(destination, out NavMeshHit hit, 2f, NavMesh.AllAreas))
+                return hit.position;
+            return destination;
+        }
+
+        private void StopApproachMovement()
+        {
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _agent.ResetPath();
+                _agent.stoppingDistance = 0.5f;
+            }
+            _approachLastChaseDest = Vector3.positiveInfinity;
+        }
+
+        private void CancelApproach()
+        {
+            if (!_approachActive) return;
+            _approachActive     = false;
+            _approachSkillIndex = -1;
+            _approachTarget     = null;
+        }
+
+        /// <summary>Chamado quando o jogador inicia movimento/ataque manual.</summary>
+        public void CancelPendingApproach()
+        {
+            if (!_approachActive) return;
+            StopApproachMovement();
+            CancelApproach();
+        }
+
+        private static bool IsMonsterGone(NetworkMonsterEntity m) => m == null || m.IsDead;
 
         // ══════════════════════════════════════════════════════════════════
         // Cast → envio
